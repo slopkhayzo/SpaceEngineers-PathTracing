@@ -1,0 +1,13 @@
+# Local reverse-engineering material, probes, runs, captures, worlds, notes.
+/research/
+
+# Local CMake/IDE outputs and generated release archives.
+/build*/
+/dist/
+/.vs/
+/CMakeUserPresets.json
+__pycache__/
+
+# NVIDIA DLSS SDK files, fetched by scripts/fetch_dlss.ps1 (UPSTREAM.md records the version).
+/third_party/dlss/*
+!/third_party/dlss/UPSTREAM.md
