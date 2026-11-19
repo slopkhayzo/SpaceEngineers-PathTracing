@@ -1,5 +1,12 @@
 # SpaceEngineers.RTHWAccel
 
+> [!WARNING]
+> This patch has been pretty much entirely been generated using AI; 
+> I won't and will never claim to have enough knowledge or expertise to do this 
+> kind of reverse-engineering by myself; I've tested (very) briefly and so far spotted 
+> no major issues (on my machine ofc, if you have issues feel free to open an Issue).
+> If you're interested and want more (human generated) info, I have a blog post [here](https://slop-blog.enkhayzomachines.net/posts/space-engineers-path-tracing-mod) :)
+
 Path-traced lighting for *Space Engineers* (Steam, 64-bit), delivered as an
 ASI plugin like [SpaceEngineers.HighFPSFix](https://github.com/slopkhayzo/SpaceEngineers-HighFPS-RIL).
 
