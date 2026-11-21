@@ -168,7 +168,7 @@ namespace SpaceEngineers.RTHWAccel
             }
             int status = NativeApi.RtInitialize(device.NativePointer, settings.GateMode, settings.DebugView,
                 settings.PatternStrength, settings.TracePath, settings.Denoiser, settings.CharacterLights,
-                settings.LampIntensity, settings.EmissiveIntensity);
+                settings.LampIntensity, settings.EmissiveIntensity, settings.DecalLights);
             if (status != 0)
             {
                 Log.Error($"The ray-tracing core did not start (step {status}, see above); the game renders as usual.");

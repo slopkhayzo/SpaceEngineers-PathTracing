@@ -18,8 +18,8 @@ namespace SpaceEngineers.RTHWAccel
     // does not count those fields as blittable and may reorder them.
     internal static unsafe class NativeApi
     {
-        public const uint ExpectedVersion = 13;
-        public const uint ExpectedSize = 216;
+        public const uint ExpectedVersion = 15;
+        public const uint ExpectedSize = 232;
 
         // sert::RtOptions.
         [StructLayout(LayoutKind.Sequential)]
@@ -34,6 +34,7 @@ namespace SpaceEngineers.RTHWAccel
             public int CharacterLights;  // 1: characters' glowing suit parts are lights
             public float LampIntensity;      // the lamps' light (traced, and the game's beyond the traced area)
             public float EmissiveIntensity;  // the light emissive surfaces cast (not their own glow)
+            public int DecalLights;          // 1: glowing decals are lights
         }
 
         private static delegate* unmanaged[Cdecl]<IntPtr, IntPtr, IntPtr*, int> s_createHook;
@@ -62,6 +63,8 @@ namespace SpaceEngineers.RTHWAccel
         private static delegate* unmanaged[Cdecl]<IntPtr, IntPtr, void> s_rtSetEnvironment;
         private static delegate* unmanaged[Cdecl]<RtLight*, uint, void> s_rtLightsSubmit;
         private static delegate* unmanaged[Cdecl]<RtSkin*, uint, float*, uint, uint*, uint, void> s_rtSkinsSubmit;
+        private static delegate* unmanaged[Cdecl]<RtDecal*, uint, void> s_rtDecalsSubmit;
+        private static delegate* unmanaged[Cdecl]<int, void> s_rtSetDecalLights;
 
         public static bool IsBound => s_log != null;
 
@@ -84,6 +87,8 @@ namespace SpaceEngineers.RTHWAccel
                 return $"RtLight is {sizeof(RtLight)} bytes, expected 104";
             if (sizeof(RtSkin) != 24)
                 return $"RtSkin is {sizeof(RtSkin)} bytes, expected 24";
+            if (sizeof(RtDecal) != 72)
+                return $"RtDecal is {sizeof(RtDecal)} bytes, expected 72";
             if (sizeof(RtMeshPart) != 20 || sizeof(RtMeshDesc) != 72 || sizeof(RtInstance) != 96 || sizeof(RtBucket) != 80 ||
                 sizeof(RtMaterialDesc) != 72)
                 return $"scene structs are {sizeof(RtMeshPart)}/{sizeof(RtMeshDesc)}/{sizeof(RtInstance)}/{sizeof(RtBucket)}/" +
@@ -114,6 +119,8 @@ namespace SpaceEngineers.RTHWAccel
             s_rtSetEnvironment = (delegate* unmanaged[Cdecl]<IntPtr, IntPtr, void>)*(IntPtr*)(bytes + 192);
             s_rtLightsSubmit = (delegate* unmanaged[Cdecl]<RtLight*, uint, void>)*(IntPtr*)(bytes + 200);
             s_rtSkinsSubmit = (delegate* unmanaged[Cdecl]<RtSkin*, uint, float*, uint, uint*, uint, void>)*(IntPtr*)(bytes + 208);
+            s_rtDecalsSubmit = (delegate* unmanaged[Cdecl]<RtDecal*, uint, void>)*(IntPtr*)(bytes + 216);
+            s_rtSetDecalLights = (delegate* unmanaged[Cdecl]<int, void>)*(IntPtr*)(bytes + 224);
             return null;
         }
 
@@ -142,7 +149,8 @@ namespace SpaceEngineers.RTHWAccel
 
         // Returns 0, or the number of the RT core's step that failed (logged natively).
         public static int RtInitialize(IntPtr d3d11Device, GateMode gateMode, DebugView debugView, float patternStrength,
-            string tracePath, Denoiser denoiser, bool characterLights, float lampIntensity, float emissiveIntensity)
+            string tracePath, Denoiser denoiser, bool characterLights, float lampIntensity, float emissiveIntensity,
+            bool decalLights)
         {
             fixed (char* path = tracePath ?? "")
             {
@@ -157,6 +165,7 @@ namespace SpaceEngineers.RTHWAccel
                     CharacterLights = characterLights ? 1 : 0,
                     LampIntensity = lampIntensity,
                     EmissiveIntensity = emissiveIntensity,
+                    DecalLights = decalLights ? 1 : 0,
                 };
                 CurrentGateMode = gateMode;
                 return s_rtInitialize(d3d11Device, &options);
@@ -319,6 +328,29 @@ namespace SpaceEngineers.RTHWAccel
             fixed (uint* palettePointer = palettes)
                 s_rtSkinsSubmit(skinPointer, (uint)skinCount, bonePointer, (uint)boneCount, palettePointer, (uint)paletteCount);
         }
+
+        // Whether glowing decals light their surroundings, from the next frame on (a fresh statistics window).
+        public static void RtSetDecalLights(bool on) => s_rtSetDecalLights(on ? 1 : 0);
+
+        // The projected decals of the next frame, in the game's draw order (copied by the native side).
+        public static void RtDecalsSubmit(RtDecal[] decals, int count)
+        {
+            fixed (RtDecal* pointer = decals)
+                s_rtDecalsSubmit(pointer, (uint)count);
+        }
+    }
+
+    // sert::rt::RtDecal: a projected decal (MyScreenDecals): the unit box placed by its world matrix (VRageMath, row
+    // vectors; translation M41..M43, rotation-scale M11..M33), its textures as a material, its maps (1 color-metal,
+    // 2 normal-gloss, 4 extensions: the game's DecalType) and its fade.
+    [StructLayout(LayoutKind.Sequential)]
+    internal unsafe struct RtDecal
+    {
+        public fixed double Translation[3];
+        public fixed float Rotation[9];
+        public uint Material;  // RtMaterialCreate handle
+        public uint Maps;
+        public float Fade;
     }
 
     // sert::rt::RtLight: a point or spot light of a MyLightComponent, in world space.

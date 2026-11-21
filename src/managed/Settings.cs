@@ -28,6 +28,9 @@ namespace SpaceEngineers.RTHWAccel
         public Denoiser Denoiser = Denoiser.Auto;
         // Characters' glowing suit parts light their surroundings (else they only glow, as in the game).
         public bool CharacterLights = true;
+        // Glowing decals (indicator lights, signs on blocks) light their surroundings (else they only glow, as in
+        // the game).
+        public bool DecalLights = true;
         // Multipliers of the lamps' light (traced, and the game's own beyond the traced area) and of the light
         // emissive surfaces cast (not their own glow); 1 = as the game sets them.
         public float LampIntensity = 1f;
@@ -47,6 +50,12 @@ namespace SpaceEngineers.RTHWAccel
         public bool InspectorSequence;
         // Before the inspector: the player character sits in the nearest free cockpit (views through a canopy).
         public bool SeatInCockpit;
+        // After the inspector (if any): bullet holes where the player's view meets a grid, and views of them
+        // (DebugAutomation.DecalSequence).
+        public bool TestDecals;
+        // Then, per armor skin listed (comma-separated subtypes; "block:<subtype>" for a block type): views of the
+        // nearest block with it (DebugAutomation.SkinSequence).
+        public string LookAtSkins = "";
         // The transparent pass's parts (glass, holograms, shields) mirrored as opaque surfaces, as before P2r (A/B).
         public bool MirrorTransparent;
         // The game's spectator camera (F8) in worlds this machine runs, also where the world does not allow it
@@ -72,6 +81,7 @@ namespace SpaceEngineers.RTHWAccel
             settings.PatternStrength = (float)ReadDouble(path, "RayTracing", "PatternStrength", settings.PatternStrength);
             settings.Denoiser = ReadDenoiser(path, "RayTracing", "Denoiser", settings.Denoiser);
             settings.CharacterLights = ReadBool(path, "RayTracing", "CharacterLights", settings.CharacterLights);
+            settings.DecalLights = ReadBool(path, "RayTracing", "DecalLights", settings.DecalLights);
             settings.LampIntensity = ReadIntensity(path, "LampIntensity", settings.LampIntensity);
             settings.EmissiveIntensity = ReadIntensity(path, "EmissiveIntensity", settings.EmissiveIntensity);
             settings.PatchShaders = ReadBool(path, "RayTracing", "PatchShaders", settings.PatchShaders);
@@ -82,6 +92,8 @@ namespace SpaceEngineers.RTHWAccel
             settings.CapturePath = ReadString(path, "Debug", "CapturePath", settings.CapturePath);
             settings.InspectorSequence = ReadBool(path, "Debug", "InspectorSequence", settings.InspectorSequence);
             settings.SeatInCockpit = ReadBool(path, "Debug", "SeatInCockpit", settings.SeatInCockpit);
+            settings.TestDecals = ReadBool(path, "Debug", "TestDecals", settings.TestDecals);
+            settings.LookAtSkins = ReadString(path, "Debug", "LookAtSkins", settings.LookAtSkins);
             settings.MirrorTransparent = ReadBool(path, "Debug", "MirrorTransparent", settings.MirrorTransparent);
             settings.FreeCamera = ReadBool(path, "Debug", "FreeCamera", settings.FreeCamera);
             settings.ScreenshotKeyName = ReadString(path, "Debug", "ScreenshotKey", "");
@@ -94,6 +106,7 @@ namespace SpaceEngineers.RTHWAccel
 
         public override string ToString() =>
             $"GateMode={GateMode}, DebugView={DebugView}, Denoiser={Denoiser}, CharacterLights={CharacterLights}, " +
+            $"DecalLights={DecalLights}, " +
             $"LampIntensity={LampIntensity.ToString(CultureInfo.InvariantCulture)}, " +
             $"EmissiveIntensity={EmissiveIntensity.ToString(CultureInfo.InvariantCulture)}, " +
             $"PatternStrength={PatternStrength.ToString(CultureInfo.InvariantCulture)}, " +

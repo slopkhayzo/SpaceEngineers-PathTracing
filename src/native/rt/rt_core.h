@@ -65,6 +65,7 @@ struct Options {
     bool characterLights = true;  // characters' glowing suit parts are lights (else they only glow)
     float lampIntensity = 1.0f;   // the lamps' light: traced (scene.cpp UploadLamps), the game's beyond the traced area
     float emissiveIntensity = 1.0f;  // the light emissive surfaces cast (lights.hlsli Emission), not their own glow
+    bool decalLights = true;  // glowing decals are lights (else they only glow; SetDecalLights changes it)
 };
 
 // Creates the D3D12 device on the adapter of the game's D3D11 device, the
@@ -91,6 +92,10 @@ void SunPassRecorded(ID3D11DeviceContext* context);
 
 void SetGateMode(GateMode mode);
 void SetDebugView(DebugView view);
+// Any thread. Whether glowing decals light their surroundings, from the next
+// frame on (the DecalLights setting; the inspector's A/B); starts a fresh
+// statistics window.
+void SetDecalLights(bool on);
 
 // Up to 8 probe pixels (x | y << 16): the material views log what their rays
 // found there (primary_view.hlsl) with each statistics window. 0 = none.

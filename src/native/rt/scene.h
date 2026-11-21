@@ -18,7 +18,7 @@ struct RtMeshPart {
     std::uint32_t indexStart;
     std::uint32_t indexCount;
     std::int32_t baseVertex;  // added to every index of the part
-    std::uint32_t flags;      // kPartAlphaMasked, kPartDoubleSided, kPartHideable
+    std::uint32_t flags;      // kPartAlphaMasked, kPartDoubleSided, kPartHideable, kPartDecal, kPartDecalPremultiplied
     std::uint32_t material;   // SceneCreateMaterial handle; 0: the game's defaults
 };
 static_assert(sizeof(RtMeshPart) == 20);
@@ -26,6 +26,16 @@ static_assert(sizeof(RtMeshPart) == 20);
 constexpr std::uint32_t kPartAlphaMasked = 1u;  // alpha tested by the game: non-opaque, tested by the rays
 constexpr std::uint32_t kPartDoubleSided = 2u;  // drawn without back-face culling
 constexpr std::uint32_t kPartHideable = 4u;  // the game hides it at times: non-opaque, tested by the rays
+// A blended decal (the game's STATIC_DECAL): non-opaque, never a hit itself; the rays blend it into the surface
+// beneath (scene_common.hlsli TraceClosestDecals, primary_view.hlsl ApplyDecals). Premultiplied: its color adds to
+// the surface's (the game's BlendDecal* states), else it is mixed in by its alpha (the NoPremult ones).
+constexpr std::uint32_t kPartDecal = 8u;
+constexpr std::uint32_t kPartDecalPremultiplied = 16u;
+// A cutout decal (the game's STATIC_DECAL_CUTOUT; also kPartAlphaMasked): solid for the camera's rays only, as it
+// lies a few millimetres above its surface (no slivers of shadow, no alpha tests in the bounces).
+constexpr std::uint32_t kPartDecalCutout = 32u;
+// The parts the rays test instead of taking as solid.
+constexpr std::uint32_t kPartNonOpaque = kPartAlphaMasked | kPartHideable | kPartDecal;
 
 // A material: the files of its four texture slots (absolute paths, as the
 // game's MyFileTexture.m_path; null: the game's default for the slot), or a
@@ -126,6 +136,25 @@ static_assert(sizeof(RtLight) == 104);
 constexpr std::uint32_t kLightSpot = 1u;
 constexpr std::uint32_t kMaxLamps = 8192;
 
+// A projected decal of this frame (the game's MyScreenDecals: bullet holes, impact marks, missile scorches, tire
+// trails, which its Decals/Decals.hlsl projects onto the G-buffer): the unit box [-0.5, 0.5]^3 placed by its world
+// matrix (VRageMath, row vectors, as RtInstance), its textures (`material`, a SceneCreateMaterial handle: ColorMetal,
+// NormalGloss, Extensions, Alphamask), the maps it has (kDecal*, the game's DecalType) and its fade (the game's
+// FadeAlpha, with age and distance). In the game's draw order. Mirrored in NativeApi.cs.
+struct RtDecal {
+    double translation[3];  // M41..M43
+    float rotation[9];      // M11..M13, M21..M23, M31..M33 (the box's axes, scaled by its size)
+    std::uint32_t material;
+    std::uint32_t maps;     // kDecalColor | kDecalNormal | kDecalExtensions
+    float fade;
+};
+static_assert(sizeof(RtDecal) == 72);
+
+constexpr std::uint32_t kDecalColor = 1u;       // MyFileTextureEnum COLOR_METAL
+constexpr std::uint32_t kDecalNormal = 2u;      // NORMALMAP_GLOSS
+constexpr std::uint32_t kDecalExtensions = 4u;  // EXTENSIONS
+constexpr std::uint32_t kMaxDecals = 4096;      // the game keeps at most 1024 decals and 1024 trails
+
 // A skinned object of this frame (a character): an instance of SceneSubmit's
 // list whose mesh the GPU poses with bone matrices, as the game's vertex
 // skinning does (USE_SKINNING). The mesh's VB0 holds the bone weights and
@@ -167,6 +196,7 @@ constexpr std::uint32_t kMaskShadow = 0x02;   // casts shadows
 
 constexpr std::uint32_t kMaxGeometryPages = 16;  // SRVs in the caller's heap: 15 pages of meshes (256 MB
                                                  // each), then the posed skinned meshes'
+constexpr std::uint32_t kMaxGeometryRecords = 1u << 20;  // SceneFrame::records' entries
 
 // One entry of the game's voxel material table, by the index voxel vertices
 // carry (MyVoxelMaterials.Table; the constants as its triplanar shaders get
@@ -205,6 +235,11 @@ struct SceneFrame {
     std::uint32_t lampCount = 0;
     std::uint32_t materialCount = 0;               // entries of the material table
     std::uint64_t materialsVersion = 0;            // changes whenever the material table is written
+    // The projected decals (SceneSubmitDecals): their boxes as procedural primitives of one instance (by index, the
+    // game's draw order) and StructuredBuffer<ProjectedDecal> (primary_view.hlsl); 0 and 0: none this frame.
+    D3D12_GPU_VIRTUAL_ADDRESS decalTlas = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS decals = 0;
+    std::uint32_t decalCount = 0;
 };
 
 // `pageDescriptors` are kMaxGeometryPages CBV/SRV/UAV descriptors of a
@@ -239,6 +274,8 @@ void SceneSubmit(const RtInstance* instances, std::uint32_t instanceCount, const
                  std::uint32_t bucketCount, const float* overrides, std::uint32_t overrideCount);
 // The lamps of the next frame (copied; at most kMaxLamps are used).
 void SceneSubmitLights(const RtLight* lights, std::uint32_t count);
+// The projected decals of the next frame (copied; at most kMaxDecals are used).
+void SceneSubmitDecals(const RtDecal* decals, std::uint32_t count);
 // The skinned objects of the next frame (copied), their bones (kBoneFloats
 // floats each) and palettes; goes with the next SceneSubmit. An instance with
 // a skin is drawn posed, or not at all while its pose cannot be made.

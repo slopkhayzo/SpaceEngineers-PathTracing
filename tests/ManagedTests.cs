@@ -32,6 +32,7 @@ internal static class ManagedTests
         Run(nameof(PatchRefusesMissingAnchor), PatchRefusesMissingAnchor);
         Run(nameof(SceneMirrorMembersResolve), SceneMirrorMembersResolve);
         Run(nameof(LampMirrorMembersResolve), LampMirrorMembersResolve);
+        Run(nameof(DecalMirrorMembersResolve), DecalMirrorMembersResolve);
         Run(nameof(ProbePixelsParse), ProbePixelsParse);
         Run(nameof(HotkeysParse), HotkeysParse);
         Run(nameof(PhotoControlsWork), PhotoControlsWork);
@@ -249,5 +250,15 @@ internal static class ManagedTests
     {
         Assembly render11 = Assembly.LoadFrom(Path.Combine(s_bin64, "VRage.Render11.dll"));
         LampMirror.Resolve(render11);
+    }
+
+    // The decal mirror's member lookups (MyScreenDecals and its nested types), and the decal record's layout
+    // (scene.h RtDecal).
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static unsafe void DecalMirrorMembersResolve()
+    {
+        Assembly render11 = Assembly.LoadFrom(Path.Combine(s_bin64, "VRage.Render11.dll"));
+        DecalMirror.Resolve(render11);
+        Check(sizeof(RtDecal) == 72, $"RtDecal is {sizeof(RtDecal)} bytes, expected 72");
     }
 }

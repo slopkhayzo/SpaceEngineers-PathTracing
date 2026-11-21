@@ -60,16 +60,16 @@ constexpr DXGI_FORMAT kRrFormats[7] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORM
 constexpr UINT kPageDescriptorsStart = static_cast<UINT>(kFramesInFlight) * kDescriptorsPerFrame;
 constexpr UINT kTextureDescriptorsStart = kPageDescriptorsStart + kMaxGeometryPages;
 constexpr UINT64 kConstantsStride = 512;
-// Per frame: 104 counters (debug_view.hlsl, primary_view.hlsl; 64 and up
+// Per frame: 112 counters (debug_view.hlsl, primary_view.hlsl; some of them
 // emissive_lights.hlsl's), then the probe records of primary_view.hlsl (24
 // uints each).
-constexpr std::size_t kStatsCounters = 104;
+constexpr std::size_t kStatsCounters = 112;
 constexpr std::size_t kMaxProbes = 8;
 constexpr std::size_t kProbeWords = 24;
 constexpr std::uint32_t kNoProbe = 0xFFFFFFFFu;
 constexpr UINT64 kProbeOffset = kStatsCounters * 4;
 constexpr UINT64 kStatsBytes = kProbeOffset + kMaxProbes * kProbeWords * 4;
-static_assert(kStatsBytes == 1184);  // primary_view.hlsl kProbeOffset = 416
+static_assert(kStatsBytes == 1216);  // primary_view.hlsl kProbeOffset = 448
 constexpr UINT64 kStatsBufferBytes = 4096;  // stats, zeros and readback buffers
 constexpr float kFarPlane = 1.0e8f;
 constexpr UINT64 kReadbackStatsStride = kStatsBytes;
@@ -307,10 +307,19 @@ struct PrimaryConstants {
     float jitter[2];                   // the primary rays' sub-pixel offset (pixels, y down; full coverage only)
     std::uint32_t fullCoverage;        // lit views in replace mode (FullLightView): every surface pixel is traced
     float emissiveIntensity;           // Options::emissiveIntensity
-    std::uint32_t padding[2];
+    std::uint32_t decalCount;          // SceneFrame::decalCount (0: no projected decals bound)
+    std::uint32_t decalLights;         // Options::decalLights, SetDecalLights
+    std::uint32_t openGeneration;      // g.seenThrough: the entries this generation wrote count (kOpenGenerationFrames)
 };
-static_assert(sizeof(PrimaryConstants) == 368);
+static_assert(sizeof(PrimaryConstants) == 372);
 static_assert(offsetof(PrimaryConstants, emissiveIntensity) == offsetof(PrimaryConstants, fullCoverage) + 4);
+static_assert(offsetof(PrimaryConstants, decalCount) == offsetof(PrimaryConstants, emissiveIntensity) + 4);
+static_assert(offsetof(PrimaryConstants, decalLights) == offsetof(PrimaryConstants, decalCount) + 4);
+static_assert(offsetof(PrimaryConstants, openGeneration) == offsetof(PrimaryConstants, decalLights) + 4);
+// How long a geometry record stays known to be seen through a face of its own object (primary_view.hlsl
+// SeenThrough) once the camera saw one of its surfaces so: the generation then moves on and the tiles looking
+// for such records must find it again (a record slot may hold another mesh by then).
+constexpr UINT64 kOpenGenerationFrames = 4096;
 static_assert(sizeof(PrimaryConstants) <= kConstantsStride);
 
 struct Retired {
@@ -368,6 +377,7 @@ struct State {
     std::atomic<int> gateMode{static_cast<int>(GateMode::overlay)};
     std::atomic<int> requestedMode{-1};
     std::atomic<int> debugView{static_cast<int>(DebugView::stripes)};
+    std::atomic<bool> decalLights{true};  // Options::decalLights, SetDecalLights
     std::atomic<UINT64> fenceValue{0};
     std::atomic<ID3D11CommandList*> lightingList{nullptr};
 
@@ -394,6 +404,10 @@ struct State {
     // Per pixel, two sets (the light history's): the light sample each pixel kept
     // (u17, lights.hlsli LightReservoirs); sized with the history, COMMON between frames.
     ComPtr<ID3D12Resource> reservoirs;
+    // Per geometry record (u26, primary_view.hlsl SeenThrough): the generation in which the camera saw one of its
+    // surfaces through a face of their own object (whose open faces then let light through to them). Zeroed at
+    // creation, generations start at 1; COMMON between frames (promoted to UNORDERED_ACCESS by the traced views).
+    ComPtr<ID3D12Resource> seenThrough;
     bool sceneReady = false;
     bool texturesReady = false;
     ComPtr<ID3D12DescriptorHeap> heap;
@@ -607,7 +621,9 @@ bool CreatePipelines() {
     // or the light list's pass (b2, root constants), the TLAS instance descs
     // (t13), the light list's buffers (u9-u16), the objects' part overrides
     // (t14), the pixels' light samples (u17), the frame's lamps (t15), the
-    // instances' previous transforms (t16) and a linear wrap sampler (s0).
+    // instances' previous transforms (t16), the projected decals' TLAS (t17)
+    // and records (t18), the records seen through their own faces (u26) and
+    // a linear wrap sampler (s0).
     const D3D12_DESCRIPTOR_RANGE ranges[4] = {
         {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 0, 0},
         {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 9, 0, 0, 4},
@@ -616,7 +632,7 @@ bool CreatePipelines() {
     };
     const D3D12_DESCRIPTOR_RANGE pageRange{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kMaxGeometryPages, 0, 1, 0};
     const D3D12_DESCRIPTOR_RANGE textureRange{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kMaxTextureDescriptors, 0, 2, 0};
-    D3D12_ROOT_PARAMETER parameters[24]{};
+    D3D12_ROOT_PARAMETER parameters[27]{};
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     parameters[0].Descriptor.ShaderRegister = 0;
     parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -657,6 +673,12 @@ bool CreatePipelines() {
     parameters[22].Descriptor.ShaderRegister = 15;  // the frame's lamps (lights.hlsli)
     parameters[23].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     parameters[23].Descriptor.ShaderRegister = 16;  // the instances' previous transforms (primary_view.hlsl)
+    parameters[24].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    parameters[24].Descriptor.ShaderRegister = 17;  // the projected decals' TLAS (primary_view.hlsl)
+    parameters[25].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    parameters[25].Descriptor.ShaderRegister = 18;  // the projected decals' records
+    parameters[26].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    parameters[26].Descriptor.ShaderRegister = 26;  // the records seen through their own faces (primary_view.hlsl)
     D3D12_STATIC_SAMPLER_DESC sampler{};
     sampler.Filter = D3D12_FILTER_ANISOTROPIC;
     sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
@@ -665,7 +687,7 @@ bool CreatePipelines() {
     sampler.MaxAnisotropy = 8;
     sampler.MaxLOD = D3D12_FLOAT32_MAX;
     sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    const D3D12_ROOT_SIGNATURE_DESC rootDesc{24, parameters, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    const D3D12_ROOT_SIGNATURE_DESC rootDesc{27, parameters, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_NONE};
     ComPtr<ID3DBlob> blob;
     ComPtr<ID3DBlob> errors;
     HRESULT hr = D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors);
@@ -740,6 +762,11 @@ bool CreatePipelines() {
         g.lights[i] = CreateBuffer(kLightBufferBytes[i], D3D12_HEAP_TYPE_DEFAULT,
                                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
         hr = g.lights[i] ? S_OK : E_OUTOFMEMORY;
+    }
+    if (SUCCEEDED(hr)) {
+        g.seenThrough = CreateBuffer(static_cast<UINT64>(kMaxGeometryRecords) * 4, D3D12_HEAP_TYPE_DEFAULT,
+                                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+        hr = g.seenThrough ? S_OK : E_OUTOFMEMORY;
     }
     if (SUCCEEDED(hr)) {
         const D3D12_RANGE none{0, 0};
@@ -1531,6 +1558,9 @@ void RecordFrame(const UINT64 frame, const int mode, const int requestedView) {
         constants.hasPrevious = g.previousFrameValid ? 1u : 0u;
         constants.characterLights = g.options.characterLights ? 1u : 0u;
         constants.emissiveIntensity = g.options.emissiveIntensity;
+        constants.decalCount = scene.decalTlas != 0 ? scene.decalCount : 0u;
+        constants.decalLights = g.decalLights.load() ? 1u : 0u;
+        constants.openGeneration = static_cast<std::uint32_t>(1 + static_cast<UINT64>(frame) / kOpenGenerationFrames);
         // Full coverage: no depth test against the game's (unjittered) G-buffer, so the primary rays can move
         // within their pixels from frame to frame (anti-aliasing through the history or Ray Reconstruction).
         const bool fullCoverage = mode == static_cast<int>(GateMode::replace) && FullLightView(requestedView);
@@ -1592,6 +1622,11 @@ void RecordFrame(const UINT64 frame, const int mode, const int requestedView) {
         // The lamps (read only for lamps the light list holds; a valid buffer when the upload had no room).
         g.list->SetComputeRootShaderResourceView(22, scene.lamps != 0 ? scene.lamps : scene.instanceData);
         g.list->SetComputeRootShaderResourceView(23, scene.previousTransforms);
+        // The projected decals (without any this frame the shader reads neither: any valid address will do).
+        const bool decals = scene.decalTlas != 0 && scene.decalCount != 0;
+        g.list->SetComputeRootShaderResourceView(24, decals ? scene.decalTlas : scene.tlas);
+        g.list->SetComputeRootShaderResourceView(25, decals ? scene.decals : scene.instanceData);
+        g.list->SetComputeRootUnorderedAccessView(26, g.seenThrough->GetGPUVirtualAddress());
         for (UINT i = 0; i < static_cast<UINT>(g.lights.size()); ++i) {
             g.list->SetComputeRootUnorderedAccessView(12 + i, g.lights[i]->GetGPUVirtualAddress());
         }
@@ -1711,7 +1746,9 @@ void PollReadbacks() {
             for (std::size_t i = 0; i < g.stats.traced.size(); ++i) {
                 g.stats.traced[i] += counters[i];
             }
-            if (ShadesMaterials(slot.view) && g.probeCount.load() != 0) {
+            // The clay view's probes: the shadow caster between a probed point and the camera (primary_view.hlsl).
+            if ((ShadesMaterials(slot.view) || slot.view == static_cast<int>(DebugView::clay)) &&
+                g.probeCount.load() != 0) {
                 std::memcpy(g.stats.probes.data(), counters + kProbeOffset / 4, sizeof(g.stats.probes));
                 g.stats.probesSeen = true;
             }
@@ -1932,6 +1969,32 @@ void Report(const wchar_t* reason) {
                     s.dispatches != 0 ? static_cast<double>(s.sceneInstances) / static_cast<double>(s.dispatches)
                                       : 0.0));
     }
+    if (s.traced[100] != 0 || s.traced[103] != 0) {
+        // primary_view.hlsl 100-103: hits on cutout decals; hits whose camera ray met blended decals, whose
+        // material one changed (ApplyDecal), whose ray met more than one; of all hits (8).
+        const auto& t = s.traced;
+        const double hits = t[8] != 0 ? static_cast<double>(t[8]) : 1.0;
+        Info(Format(L"decals: the camera's rays hit cutout decals on %.2f %% of the hits; they met blended decals "
+                    L"on %.3f %%, which changed the material on %.3f %%; more than one met on %.3f %%.",
+                    100.0 * static_cast<double>(t[100]) / hits, 100.0 * static_cast<double>(t[101]) / hits,
+                    100.0 * static_cast<double>(t[102]) / hits, 100.0 * static_cast<double>(t[103]) / hits));
+    }
+    if (s.traced[104] != 0) {
+        // primary_view.hlsl 104-111: hits inside a projected decal's box, changed by one, inside more than the
+        // shader keeps; compared pixels one changed, of them those within 0.05 / 0.02 of the G-buffer's base color
+        // and within 15 / 5 degrees of its normal (the game's decal pass blends its decals into it).
+        const auto& t = s.traced;
+        const double hits = t[8] != 0 ? static_cast<double>(t[8]) : 1.0;
+        const double compared = t[107] != 0 ? static_cast<double>(t[107]) : 1.0;
+        Info(Format(L"projected decals: the camera's rays hit inside one's box on %.3f %% of the hits, one changed "
+                    L"the material on %.3f %%, more than kept on %.4f %%; where one changed it and the G-buffer is "
+                    L"compared (%llu pixels), base color within 0.05 on %.1f %%, 0.02 on %.1f %%, normals within 15 "
+                    L"degrees on %.1f %%, 5 degrees on %.1f %%.",
+                    100.0 * static_cast<double>(t[104]) / hits, 100.0 * static_cast<double>(t[105]) / hits,
+                    100.0 * static_cast<double>(t[106]) / hits, static_cast<unsigned long long>(t[107]),
+                    100.0 * static_cast<double>(t[108]) / compared, 100.0 * static_cast<double>(t[109]) / compared,
+                    100.0 * static_cast<double>(t[110]) / compared, 100.0 * static_cast<double>(t[111]) / compared));
+    }
     if (s.traced[16] != 0) {
         // primary_view.hlsl 16-23: compared pixels; base color within 0.02 / 0.05 / 0.15 (sRGB, worst
         // channel); shading normal within 5 / 15 degrees; roughness within 0.05; metalness within 0.1.
@@ -2002,6 +2065,12 @@ void Report(const wchar_t* reason) {
                     t[61] != 0 ? static_cast<double>(t[62]) / static_cast<double>(t[61]) : 0.0,
                     100.0 * static_cast<double>(t[74]) / static_cast<double>(t[60]),
                     100.0 * static_cast<double>(t[75]) / moving, 100.0 * static_cast<double>(t[76]) / moving));
+        // primary_view.hlsl 15, 63: shadow rays that took the open-face pass (scene_common.hlsli Occluded); lit
+        // pixels the camera sees through a face of their own object.
+        Info(Format(L"open faces: lit pixels seen through a face of their own object %.3f %%; shadow rays taking "
+                    L"the open-face pass %.4f per lit pixel.",
+                    100.0 * static_cast<double>(t[63]) / static_cast<double>(t[60]),
+                    static_cast<double>(t[15]) / static_cast<double>(t[60])));
         if (g.rrEvaluated != 0) {
             Info(Format(L"DLSS Ray Reconstruction: %llu frames denoised.", static_cast<unsigned long long>(g.rrEvaluated)));
             g.rrEvaluated = 0;
@@ -2158,7 +2227,8 @@ int Gate() {
     if (requested >= 0) {
         Report(L"before the mode switch");
         g.gateMode.store(requested);
-        Info(Format(L"gate mode is now %s (debug view %s).", ModeName(requested), ViewName(g.debugView.load())));
+        Info(Format(L"gate mode is now %s (debug view %s%s).", ModeName(requested), ViewName(g.debugView.load()),
+                    g.decalLights.load() ? L"" : L"; glowing decals only glow"));
     }
     double frameMs = 0.0;
     if (g.lastFrame.QuadPart != 0) {
@@ -2317,6 +2387,9 @@ int Initialize(ID3D11Device* gameDevice, const Options& options) {
                                                       : L"DLSS Ray Reconstruction where available, else our filter"));
     Info(options.characterLights ? L"characters' glowing suit parts light their surroundings."
                                  : L"characters' glowing suit parts only glow (CharacterLights = false).");
+    Info(options.decalLights ? L"glowing decals light their surroundings."
+                             : L"glowing decals only glow (DecalLights = false).");
+    g.decalLights.store(options.decalLights);
     Info(Format(L"light multipliers: lamps %.2f (LampIntensity), the light emissive surfaces cast %.2f "
                 L"(EmissiveIntensity).", options.lampIntensity, options.emissiveIntensity));
     g.gateMode.store(static_cast<int>(options.gateMode));
@@ -2586,6 +2659,11 @@ void SetGateMode(const GateMode mode) {
 
 void SetDebugView(const DebugView view) {
     g.debugView.store(static_cast<int>(view));
+    g.requestedMode.store(g.gateMode.load());  // starts a fresh statistics window
+}
+
+void SetDecalLights(const bool on) {
+    g.decalLights.store(on);
     g.requestedMode.store(g.gateMode.load());  // starts a fresh statistics window
 }
 

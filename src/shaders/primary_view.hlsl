@@ -109,8 +109,8 @@ RWTexture2D<float4> AlbedoEmission : register(u4);  // lit pixels: rgb the albed
 // the first mip's faces +X, -X, +Y, -Y, +Z, -Z side by side (env_atlas.hlsl).
 Texture2D<float4> EnvironmentFar : register(t9);
 Texture2D<float4> EnvironmentClose : register(t10);
-// 96 uint counters (offset = 4 * index, see the Count calls below; 64 and up
-// the light list's, emissive_lights.hlsl), then the probe records
+// 112 uint counters (offset = 4 * index, see the Count calls below; some of
+// them the light list's, emissive_lights.hlsl), then the probe records
 // (kProbeOffset).
 RWByteAddressBuffer Stats : register(u1);
 StructuredBuffer<VoxelMaterial> VoxelMaterials : register(t8);
@@ -128,10 +128,28 @@ RWTexture2D<float4> RrSpecularAlbedo : register(u21);
 RWTexture2D<float4> RrNormalRoughness : register(u22);   // world normal, roughness
 RWTexture2D<float> RrDepth : register(u23);              // linear view depth (far for the sky)
 RWTexture2D<float> RrSpecularHitDistance : register(u25);  // the specular bounce's length (far: it escaped)
+// Per geometry record (its index x 4): OpenGeneration once the camera saw one of its surfaces through a face of
+// their own object (rt_core.cpp seenThrough): the pixels that show its surfaces look whether they are seen so.
+RWByteAddressBuffer SeenThrough : register(u26);
+// The frame's projected decals (ApplyProjectedDecals): their boxes as procedural primitives of one instance, by
+// index (their draw order), and their records.
+RaytracingAccelerationStructure DecalScene : register(t17);
+
+// Mirrors GpuDecal in scene.cpp.
+struct ProjectedDecal
+{
+    float4 toBox[3];  // camera-relative world -> the decal's box [-0.5, 0.5]^3: box.x = dot(toBox[0], float4(p, 1))
+    float3 axis;      // the direction the game projects it along (the box's -z), unit
+    float fade;       // the game's FadeAlpha (with age and distance)
+    uint material;    // into Materials: ColorMetal, NormalGloss, Extensions, Alphamask
+    uint maps;        // kDecalColor | kDecalNormal | kDecalExtensions: the maps it has (the game's DecalType)
+    uint2 padding;
+};
+StructuredBuffer<ProjectedDecal> ProjectedDecals : register(t18);
 
 static const uint kNoProbe = 0xFFFFFFFF;
 static const uint kMaxProbes = 8;
-static const uint kProbeOffset = 416;  // bytes: after the 104 counters (rt_core.cpp kProbeOffset)
+static const uint kProbeOffset = 448;  // bytes: after the 112 counters (rt_core.cpp kProbeOffset)
 static const uint kProbeBytes = 96;    // 24 uints per probe (rt_core.cpp decodes them)
 
 // compute_screen_ray (Frame.hlsli): view-space direction with z = -1.
@@ -655,6 +673,247 @@ MaterialSample ShadeMaterial(Surface surface, float4 instance, float4 extra, uin
     return result;
 }
 
+// --- Decals ---------------------------------------------------------------------
+
+static const float kNormalDotFactor = 4;  // PixelUtils.hlsli NORMAL_DOT_FACTOR
+static const float kAoBumpPow = 4;        // PixelUtils.hlsli AO_BUMP_POW
+// How far from the hit surface's plane a decal the ray met still lies on it (the game's decals sit a few
+// millimetres above theirs).
+static const float kDecalReach = 0.03;
+
+// One blended decal over the hit's material, as the game's G-buffer pass blends it
+// (Geometry/Passes/GBuffer/PixelStage.hlsli STATIC_DECAL into GBuffer/GBufferWrite.hlsli GbufferWriteBlend, with the
+// BlendDecal* state MyGBufferRenderPass.GetAlphamaskBlendState picks by the maps the decal has): its alpha mask `a`
+// mixes in its color and metalness (with a color-metal map), its gloss (a normal-gloss map) and its emissive (an
+// extensions map); premultiplied, the decal's values are added and the surface's kept by 1 - a, else the two mix by
+// a. Its normal and AO mix by alphaN: the mask, or how far the decal's normal map turns from its own surface
+// (ComputeNormalMapAlphaBestEffort); without an extensions map its AO is that turn's
+// (ComputeAmbientOcclusionBestEffort). Whether it lies on the hit surface: within kDecalReach of its plane and not
+// behind it.
+// The decal is a part of the hit's instance: its transform (`toWorld`) and instance data are the hit's.
+bool ApplyDecal(inout MaterialSample m, DecalHits h, uint hitInstance, float3x3 toWorld, float4 instance,
+                float4 extra, float3 direction, float hitT, float3 hitNormal, float coneSpread)
+{
+    if (h.count == 0 || h.instanceIndex != hitInstance || h.t > hitT * 1.0001 + 0.001 ||
+        abs(dot(direction * (h.t - hitT), hitNormal)) > kDecalReach)
+        return false;
+    GeometryRecord record = Records[h.record];
+    MaterialRecord material = Materials[record.Material];
+    Surface ds = LoadSurface(record, h.primitive, h.barycentrics, toWorld, direction, coneSpread * h.t);
+    if (!ds.hasAttributes || material.Textures.w == kAlphamaskSlotNone)
+        return false;
+    ds.geometryIndex = h.geometryIndex;
+    float a = SampleTexture(material.Textures.w, ds.uv, ds.lodBase).r;
+    MaterialSample d = ShadeMaterial(ds, instance, extra, kShadeAll);
+    float give = (record.Flags & kPartDecalPremultiplied) != 0 ? 1 : a;
+    float keep = 1 - a;
+    bool colorMap = material.Textures.x >= kFallbackSlots;
+    bool normalMap = material.Textures.y >= kFallbackSlots;
+    bool extensions = material.Textures.z >= kFallbackSlots;
+    if (colorMap)
+    {
+        m.baseColor = d.baseColor * give + m.baseColor * keep;
+        m.metalness = d.metalness * give + m.metalness * keep;
+    }
+    float normalAlpha = 0;
+    if (normalMap)
+    {
+        float bend = dot(d.normal, ds.normal);
+        normalAlpha = max(a, saturate((1 - bend) * kNormalDotFactor));
+        float ao = extensions ? d.ao : pow(saturate(bend), kAoBumpPow);
+        m.gloss = d.gloss * give + m.gloss * keep;
+        m.normal = normalize(lerp(m.normal, d.normal, normalAlpha));
+        m.ao = lerp(m.ao, ao, normalAlpha);
+    }
+    if (extensions)
+        m.emissive = d.emissive * give + m.emissive * keep;
+    return a > 0 || normalAlpha > 0;
+}
+
+// --- Projected decals ------------------------------------------------------------
+//
+// The game's projected decals (MyScreenDecals: bullet holes, impact marks, missile scorches, tire trails; scene.h
+// RtDecal): boxes whose textures it projects onto whatever surface lies inside them, after the G-buffer pass
+// (Decals/Decals.hlsl). Here their boxes are the procedural primitives of an acceleration structure of their own
+// (scene.cpp UploadDecals): a ray of almost no length from a camera ray's hit meets those around it.
+
+static const uint kDecalColor = 1;       // the game's MyFileTextureEnum COLOR_METAL
+static const uint kDecalNormal = 2;      // NORMALMAP_GLOSS
+static const uint kDecalExtensions = 4;  // EXTENSIONS
+static const uint kMaxPointDecals = 8;   // per point; beyond them the earliest drawn are left out
+static const float kDecalFadeThreshold = 0.3;  // Decals.hlsl FADE_THRESHOLD: |z| where the normal starts to fade
+static const float kAoDistanceBoost = 14.0;    // Decals.hlsl AO_DISTANCE_BOOST
+static const float kNormalAoBoostRatio = 0.01; // Decals.hlsl NORMAL_AO_BOOST_RATIO
+
+float3 DecalBoxPoint(ProjectedDecal d, float3 p)
+{
+    float4 h = float4(p, 1);
+    return float3(dot(d.toBox[0], h), dot(d.toBox[1], h), dot(d.toBox[2], h));
+}
+
+// The projected decals over material `m` at a camera ray's hit `position` (camera-relative), in the game's draw
+// order (their index), as Decals.hlsl blends them into its G-buffer (GbufferWriteBlend under the premultiplied
+// BlendDecal* state of the decal's maps, MyMeshMaterials1.GetMaterialTextureBlendState): where the box holds the
+// point and the surface faces its axis (|cos| >= 0.33), the alpha mask a times the fade f lays the color and
+// metalness over the surface's (added, the surface kept by 1 - a f: the textures are premultiplied), the gloss
+// with a normal map, the emissive with an extensions map; the normal (the map turned into the box's frame across
+// the surface, PixelTangentSpace with the x flip of adjust_normalmap_no_precomputed_tangents) and AO mix in by
+// alphaN f: the mask, or how far the map turns from flat (ComputeNormalMapAlphaBestEffort), faded toward the box's
+// depth ends; the AO is the extensions map's, else the turn's (ComputeAmbientOcclusionBestEffort), both boosted
+// beyond kAoDistanceBoost of view depth (`viewDepth`). The surface's own normal (the game's G-buffer copy) is the
+// one before any of them. `footprint`: the ray cone's width across the surface (log2 metres; the mip).
+// Returns how many changed the material; `met`: the boxes holding the point; `dropped`: more than kMaxPointDecals.
+uint ApplyProjectedDecals(inout MaterialSample m, float3 position, float viewDepth, float footprint, out uint met,
+                          out bool dropped)
+{
+    met = 0;
+    dropped = false;
+    if (DecalCount == 0)
+        return 0;
+    RayDesc ray;
+    ray.Origin = position;
+    ray.Direction = float3(0, 0, 1);
+    ray.TMin = 0;
+    ray.TMax = 1e-4;
+    RayQuery<RAY_FLAG_SKIP_TRIANGLES> query;
+    query.TraceRayInline(DecalScene, RAY_FLAG_NONE, 0xFF, ray);
+    // The boxes holding the point, by index; 0xFFFFFFFF: free (sorted last).
+    uint found[kMaxPointDecals];
+    [unroll]
+    for (uint f = 0; f < kMaxPointDecals; ++f)
+        found[f] = 0xFFFFFFFF;
+    uint count = 0;
+    while (query.Proceed())
+    {
+        if (query.CandidateType() != CANDIDATE_PROCEDURAL_PRIMITIVE)
+            continue;
+        uint index = query.CandidatePrimitiveIndex();
+        if (index >= DecalCount || any(abs(DecalBoxPoint(ProjectedDecals[index], position)) > 0.5))
+            continue;
+        // The slots stay in registers: indexed by loop counters only.
+        bool known = false;
+        uint earliest = 0;               // the slot of the earliest drawn
+        uint earliestIndex = found[0];
+        [unroll]
+        for (uint k = 0; k < kMaxPointDecals; ++k)
+        {
+            known = known || found[k] == index;
+            if (found[k] < earliestIndex)
+            {
+                earliest = k;
+                earliestIndex = found[k];
+            }
+        }
+        if (known)
+            continue;  // reported again
+        ++met;
+        if (count < kMaxPointDecals)
+        {
+            [unroll]
+            for (uint k = 0; k < kMaxPointDecals; ++k)
+            {
+                if (k == count)
+                    found[k] = index;
+            }
+            ++count;
+            continue;
+        }
+        dropped = true;
+        [unroll]
+        for (uint k = 0; k < kMaxPointDecals; ++k)
+        {
+            if (k == earliest && earliestIndex < index)
+                found[k] = index;
+        }
+    }
+    if (count == 0)
+        return 0;
+    // In draw order: an odd-even transposition sort of the slots.
+    [unroll]
+    for (uint pass = 0; pass < kMaxPointDecals; ++pass)
+    {
+        [unroll]
+        for (uint k = pass & 1; k + 1 < kMaxPointDecals; k += 2)
+        {
+            uint low = min(found[k], found[k + 1]);
+            uint high = max(found[k], found[k + 1]);
+            found[k] = low;
+            found[k + 1] = high;
+        }
+    }
+
+    float3 N = m.normal;
+    float boost = viewDepth > kAoDistanceBoost ? kAoDistanceBoost / viewDepth : 1;
+    uint applied = 0;
+    [unroll]
+    for (uint i = 0; i < kMaxPointDecals; ++i)
+    {
+        if (i >= count)
+            break;
+        ProjectedDecal d = ProjectedDecals[found[i]];
+        if (abs(dot(d.axis, N)) < 0.33)
+            continue;
+        float3 b = DecalBoxPoint(d, position);
+        float2 uv = 0.5 - b.xy;
+        // The gradients of u and v across the surface: the normal map's frame and the mip.
+        float3 du = -d.toBox[0].xyz;
+        float3 dv = -d.toBox[1].xyz;
+        du -= N * dot(N, du);
+        dv -= N * dot(N, dv);
+        float lodBase = footprint + 0.5 * log2(max(length(du) * length(dv), 1e-12));
+        MaterialRecord material = Materials[d.material];
+        // Its mask (every decal of the game has one) and color map still loading: left out, not a dark square.
+        if (material.Textures.w < kFallbackSlots || ((d.maps & kDecalColor) != 0 && material.Textures.x < kFallbackSlots))
+            continue;
+        float a = SampleTexture(material.Textures.w, uv, lodBase).r;
+        float fade = d.fade;
+        float keep = 1 - a * fade;
+        if ((d.maps & kDecalColor) != 0)
+        {
+            float4 cm = SampleTexture(material.Textures.x, uv, lodBase);
+            m.baseColor = cm.rgb * fade + m.baseColor * keep;
+            m.metalness = cm.a * fade + m.metalness * keep;
+        }
+        float4 ext = 0;
+        if ((d.maps & kDecalExtensions) != 0)
+            ext = SampleTexture(material.Textures.z, uv, lodBase);
+        float normalAlpha = 0;
+        if ((d.maps & kDecalNormal) != 0)
+        {
+            float4 ng = SampleTexture(material.Textures.y, uv, lodBase);
+            float3 nm = normalize(ng.xyz * 2 - 1);
+            nm.z *= (1 - kNormalAoBoostRatio) + kNormalAoBoostRatio * boost;
+            nm = normalize(nm);
+            float scale = rsqrt(max(max(dot(du, du), dot(dv, dv)), 1e-12));
+            float3 turned = normalize((nm.x * du - nm.y * dv) * scale + nm.z * N);
+            float ao = (d.maps & kDecalExtensions) != 0 ? ext.r : pow(saturate(dot(N, turned)), kAoBumpPow);
+            ao *= boost * boost;
+            normalAlpha = max(a, saturate((1 - nm.z) * kNormalDotFactor));
+            float depthEnd = abs(b.z);
+            if (depthEnd > kDecalFadeThreshold)
+                normalAlpha *= saturate((0.5 - depthEnd) / (0.5 - kDecalFadeThreshold));
+            float n = normalAlpha * fade;
+            m.normal = normalize(lerp(m.normal, turned, n));
+            m.ao = lerp(m.ao, ao, n);
+            m.gloss = ng.a * fade + m.gloss * keep;
+        }
+        if ((d.maps & kDecalExtensions) != 0)
+            m.emissive = ext.g * fade + m.emissive * keep;
+        applied += (a > 0 || normalAlpha > 0) && fade > 0 ? 1 : 0;
+    }
+    return applied;
+}
+
+// The shading normal for the light, on the side of the surface the ray sees (`geometricNormal`, facing the ray). A
+// normal on the other side (a double-sided part's back face, a mesh whose normals point away from its visible side)
+// would take no light at all: every direction toward a light, and every bounce, lies below one of the two. It is
+// mirrored across the surface instead, keeping its tilt (the game lights such surfaces by its ambient alone).
+float3 SeenSideNormal(float3 normal, float3 geometricNormal)
+{
+    float d = dot(normal, geometricNormal);
+    return d < 0 ? normalize(normal - 2 * d * geometricNormal) : normal;
+}
+
 // A traced material against the G-buffer's at one pixel.
 struct MaterialError
 {
@@ -852,7 +1111,7 @@ float3 EnvironmentBrdf(float3 f0, float roughness, float nv)
 // V, if one ray toward a point of the sun's disc is free; AO as the game's.
 // The diffuse part without the albedo, the specular part.
 void SunLight(float3 position, float3 geometricNormal, MaterialSample m, float3 V, inout uint seed,
-              out float3 diffuse, out float3 specular)
+              out float3 diffuse, out float3 specular, uint self)
 {
     float3 toSun = normalize(-Game.Light.directionalLightVec);
     float3 f0 = lerp(0.04, m.baseColor, m.metalness);
@@ -863,7 +1122,7 @@ void SunLight(float3 position, float3 geometricNormal, MaterialSample m, float3 
         return;
     float discRadius = clamp(acos(saturate(Game.Light.SunDiscInnerDot)), 0.002, 0.05);
     float3 toDisc = ConeDirection(toSun, discRadius, Random(seed), Random(seed));
-    float shadow = dot(toDisc, geometricNormal) > 0 && !Occluded(position, toDisc, FarPlane) ? 1 : 0;
+    float shadow = dot(toDisc, geometricNormal) > 0 && !Occluded(position, toDisc, FarPlane, 0, self) ? 1 : 0;
     shadow = 1 - (1 - shadow) * (1 - Game.Light.shadowFadeout);
     float lightAO = saturate(1 - (1 - m.ao) * Game.Light.aoDirLight);
     diffuse *= shadow * lightAO;
@@ -1023,13 +1282,14 @@ void LightCandidates(inout LightChoice choice, uint count, float3 position, floa
 
 // Whether the way from `position` to the chosen point is free, up to just before the light: a triangle's own
 // surface, a lamp's fitting around it do not shadow it.
-bool LightVisible(LightTriangle light, float3 position, float3 lightPoint, out float3 L, out float distance)
+bool LightVisible(LightTriangle light, float3 position, float3 lightPoint, out float3 L, out float distance,
+                  uint self)
 {
     float3 toLight = lightPoint - position;
     distance = length(toLight);
     L = toLight / max(distance, 1e-6);
     float maxT = IsLamp(light) ? distance - kLampSkip : distance * 0.998;
-    return !(maxT > 0.001 && Occluded(position, L, maxT));
+    return !(maxT > 0.001 && Occluded(position, L, maxT, 0, self));
 }
 
 // What a visible light sample sends to the shading point, times its contribution weight W: the diffuse light
@@ -1078,7 +1338,7 @@ float3 ShadeLight(LightTriangle light, float2 weights, float3 L, float distance,
 // kept at this point and at a neighbour (found again by their light's key).
 float3 SampledLight(uint2 pixel, float3 surfacePoint, float3 previousPoint, float3 position, MaterialSample m,
                     float3 geometricNormal, float3 V, float indirectAO, inout uint seed, out float3 specular,
-                    out LightSampleInfo info)
+                    out LightSampleInfo info, uint self)
 {
     info = (LightSampleInfo)0;
     specular = 0;
@@ -1182,7 +1442,7 @@ float3 SampledLight(uint2 pixel, float3 surfacePoint, float3 previousPoint, floa
     info.twoSided = (asuint(light.uv2.z) & kLightTwoSided) != 0;
     float3 L;
     float distance;
-    bool visible = LightVisible(light, position, choice.lightPoint, L, distance);
+    bool visible = LightVisible(light, position, choice.lightPoint, L, distance, self);
     info.distance = distance;
     if (!visible)
     {
@@ -1224,7 +1484,7 @@ static const uint kBounceCandidates = 4;
 static const float kSpecularLightWeight = 0.3;
 
 float3 BounceLight(float3 surfacePoint, float3 position, MaterialSample m, float3 geometricNormal, float3 V,
-                   float indirectAO, inout uint seed, out float3 specular, out uint status)
+                   float indirectAO, inout uint seed, out float3 specular, out uint status, uint self)
 {
     specular = 0;
     status = 0;
@@ -1239,7 +1499,7 @@ float3 BounceLight(float3 surfacePoint, float3 position, MaterialSample m, float
     LightTriangle light = Lights[choice.index];
     float3 L;
     float distance;
-    if (!LightVisible(light, position, choice.lightPoint, L, distance))
+    if (!LightVisible(light, position, choice.lightPoint, L, distance, self))
         return 0;
     status = 2;
     return ShadeLight(light, choice.weights, L, distance, position, m, V, indirectAO, W, specular);
@@ -1256,9 +1516,11 @@ static const float kEscapedDistance = 10000;
 // them; with `lightsSampled`, listed emissive triangles (lights.hlsli) emit
 // nothing here: their light comes through SampledLight. With the
 // CharacterLights setting off, characters' glowing suit parts emit nothing
-// here either (scene_common.hlsli GlowsOnly).
+// here either (scene_common.hlsli GlowsOnly). `openInstance`: the object
+// whose open faces let light through to a hit on it (the camera sees the
+// pixel's surface through one of them: main's openSelf), or kNoInstance.
 float3 IncomingLight(float3 origin, float3 direction, float pathLength, float coneSpread, float environmentFactor,
-                     bool lightsSampled, bool sampleLights, inout uint seed, inout uint lightStatus,
+                     bool lightsSampled, bool sampleLights, uint openInstance, inout uint seed, inout uint lightStatus,
                      out float hitDistance)
 {
     RayDesc ray;
@@ -1281,6 +1543,7 @@ float3 IncomingLight(float3 origin, float3 direction, float pathLength, float co
     float4 instance = InstanceData[instanceIndex * 2];
     float4 extra = InstanceData[instanceIndex * 2 + 1];
     MaterialSample m = ShadeMaterial(s, instance, extra, kShadeAll);
+    m.normal = SeenSideNormal(m.normal, s.geometricNormal);
     float3 position = origin + direction * t;
     position += s.geometricNormal * (0.002 + 0.0005 * (pathLength + t));
     float3 albedo = m.baseColor * (1 - m.metalness);
@@ -1290,14 +1553,15 @@ float3 IncomingLight(float3 origin, float3 direction, float pathLength, float co
          (lightsSampled && ListedLight(s.record, instance, extra, s.geometryIndex, query.CommittedPrimitiveIndex()))))
         emission = 0;
     float3 diffuse, specular;
-    SunLight(position, s.geometricNormal, m, -direction, seed, diffuse, specular);
+    uint self = instanceIndex == openInstance ? instanceIndex : kNoInstance;
+    SunLight(position, s.geometricNormal, m, -direction, seed, diffuse, specular, self);
     if (sampleLights)
     {
         // The lamps' and emitters' light at the hit: their light's first bounce.
         float hitAO = saturate(1 - (1 - m.ao) * Game.Light.aoIndirectLight);
         float3 lightSpecular;
         diffuse += BounceLight(origin + direction * t, position, m, s.geometricNormal, -direction, hitAO, seed,
-                               lightSpecular, lightStatus);
+                               lightSpecular, lightStatus, self);
         specular += lightSpecular;
     }
     return albedo * (emission + diffuse) + specular;
@@ -1378,7 +1642,8 @@ void main(uint3 id : SV_DispatchThreadID)
     ray.Direction = direction;
     ray.TMin = NearPlane;
     ray.TMax = FarPlane;
-    RayQuery<RAY_FLAG_NONE> query = TraceClosest(ray, RayFlags, 0x01, coneSpread);
+    DecalHits decals;
+    RayQuery<RAY_FLAG_NONE> query = TraceClosestDecals(ray, RayFlags, 0x01, coneSpread, decals);
 
     bool hit = query.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
     float rayZ = hit ? query.CommittedRayT() : 0;
@@ -1396,6 +1661,7 @@ void main(uint3 id : SV_DispatchThreadID)
     uint recordIndex = 0;
     float4 instance = 0;
     float4 blockData = 0;  // cube and generic records: texture offset, pattern bytes, source
+    uint hitInstance = 0;  // the hit's TLAS instance (ApplyDecal)
     // Where the surface point was in the previous recorded frame, relative to that frame's camera
     // (research/docs/space-engineers-rt-plan.md §6.1): its object-space position through the instance's
     // transform then (moving grids, rotors, doors; at rest: the camera's motion alone), on a posed skinned mesh
@@ -1420,8 +1686,36 @@ void main(uint3 id : SV_DispatchThreadID)
         s.geometryIndex = query.CommittedGeometryIndex();
         kind = Kind(s.record);
         front = query.CommittedTriangleFrontFace();
-        instance = InstanceData[query.CommittedInstanceIndex() * 2];
-        blockData = InstanceData[query.CommittedInstanceIndex() * 2 + 1];
+        hitInstance = query.CommittedInstanceIndex();
+        instance = InstanceData[hitInstance * 2];
+        blockData = InstanceData[hitInstance * 2 + 1];
+    }
+    // Whether the camera sees the hit through a one-sided face of its own object met from behind: a cavity modelled
+    // as an inward-facing box shows through its lid this way (the Collector's funnel throat), and its walls would
+    // get no light past the lid. Then such faces are open to the light of the hit's shadow rays and of its bounces'
+    // hits on that object (openSelf: scene_common.hlsli Occluded's `self`). The pixels on records seen so before
+    // (SeenThrough) look, and to find more one 8x8 tile in 16 per frame (whole tiles: the other waves skip it).
+    uint openSelf = kNoInstance;
+    bool seenBefore = hit && SeenThrough.Load(recordIndex * 4) == OpenGeneration;
+    if (hit && front && (seenBefore || ((Pcg((id.x >> 3) + Pcg(id.y >> 3)) + Frame) & 15) == 0))
+    {
+        RayDesc behind = ray;
+        behind.TMax = rayZ * 0.9999;
+        RayQuery<RAY_FLAG_CULL_FRONT_FACING_TRIANGLES | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
+                 RAY_FLAG_FORCE_OPAQUE> seen;
+        seen.TraceRayInline(Scene, RAY_FLAG_NONE, 0x02, behind);
+        seen.Proceed();
+        if (seen.CommittedStatus() == COMMITTED_TRIANGLE_HIT && seen.CommittedInstanceIndex() == hitInstance &&
+            !seen.CommittedTriangleFrontFace())
+        {
+            GeometryRecord seenRecord = Records[seen.CommittedInstanceID() + seen.CommittedGeometryIndex()];
+            if ((seenRecord.Flags & 2) == 0 && !IsDecal(seenRecord))
+            {
+                openSelf = hitInstance;
+                if (!seenBefore)
+                    SeenThrough.Store(recordIndex * 4, OpenGeneration);
+            }
+        }
     }
     uint source = SourceOf(blockData);
     bool deformed = hit && Deformed(s.record, source);
@@ -1502,13 +1796,41 @@ void main(uint3 id : SV_DispatchThreadID)
             uint seed = Pcg(id.x + Pcg(id.y + Pcg(Frame)));
             float3 toSun = ConeDirection(SunToward, SunRadius, Random(seed), Random(seed));
             float lit = saturate(dot(n, toSun));
-            if (lit > 0 && Occluded(origin, toSun, FarPlane))
+            if (lit > 0 && Occluded(origin, toSun, FarPlane, 0, openSelf))
                 lit = 0;
             float open = 0;
             [unroll]
             for (uint sample = 0; sample < 2; ++sample)
-                open += Occluded(origin, CosineDirection(n, Random(seed), Random(seed)), 5.0) ? 0 : 0.5;
+                open += Occluded(origin, CosineDirection(n, Random(seed), Random(seed)), 5.0, 0, openSelf) ? 0 : 0.5;
             color = 0.7 * (SunColor * lit + Ambient * open);
+            // Probes: the first shadow caster (instance mask 0x02) between the point and the camera, which sees it
+            // (rt_core.cpp LogProbes prints it as a hit: "ray depth" its distance, "G-buffer" the point's): what
+            // keeps the light from a point the camera's rays reach.
+            uint probe = ProbeAt(id.xy);
+            if (probe != kNoProbe)
+            {
+                RayDesc back;
+                back.Origin = origin;
+                back.Direction = -direction;
+                back.TMin = 0;
+                back.TMax = rayZ;
+                RayQuery<RAY_FLAG_NONE> caster = TraceClosest(back, RAY_FLAG_NONE, 0x02, coneSpread);
+                bool blocked = caster.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+                GeometryRecord br = (GeometryRecord)0;
+                if (blocked)
+                    br = Records[caster.CommittedInstanceID() + caster.CommittedGeometryIndex()];
+                uint base = kProbeOffset + probe * kProbeBytes;
+                Stats.Store4(base, uint4(1 | (blocked ? 2 : 0) | ((Kind(br) & 0xFF) << 8),
+                                         blocked ? caster.CommittedInstanceIndex() : 0,
+                                         blocked ? caster.CommittedInstanceID() : 0,
+                                         blocked ? caster.CommittedGeometryIndex() : 0));
+                Stats.Store4(base + 16, uint4(blocked ? caster.CommittedPrimitiveIndex() : 0, br.Layout, br.Material, 0));
+                Stats.Store4(base + 32, uint4(0, 0, 0, 0));
+                Stats.Store4(base + 48, uint4(0, 0, 0, 0));
+                Stats.Store4(base + 64, uint4(0, 0, 0, 0));
+                Stats.Store4(base + 80, uint4(0, asuint(blocked ? caster.CommittedRayT() : 0), asuint(rayZ),
+                                              (br.Flags & 0xFF) | (s.record.Flags << 8)));
+            }
         }
     }
     else if (Mode == 10)
@@ -1527,9 +1849,17 @@ void main(uint3 id : SV_DispatchThreadID)
         MaterialSample noOffset = (MaterialSample)0;
         MaterialSample vertexFrame = (MaterialSample)0;
         MaterialSample raw = (MaterialSample)0;
+        bool decalApplied = false;
+        uint projectedMet = 0;
+        uint projectedApplied = 0;
+        bool projectedDropped = false;
         if (hit)
         {
             material = ShadeMaterial(s, instance, blockData, kShadeAll);
+            decalApplied = ApplyDecal(material, decals, hitInstance, s.toWorld, instance, blockData, direction,
+                                      rayZ, s.geometricNormal, coneSpread);
+            projectedApplied = ApplyProjectedDecals(material, direction * rayZ, rayZ, s.footprint, projectedMet,
+                                                    projectedDropped);
             if (variants)
             {
                 noOffset = ShadeMaterial(s, instance, blockData, kShadeAll & ~kShadeTextureOffset);
@@ -1551,6 +1881,24 @@ void main(uint3 id : SV_DispatchThreadID)
         Count(21, compared && e.normalCosine > 0.9659);  // 15 degrees
         Count(22, compared && e.roughness < 0.05);
         Count(23, compared && e.metalness < 0.1);
+        // Decals: hits on cutout decals; hits whose ray met blended decals, whose material one changed
+        // (ApplyDecal), whose ray met more than one.
+        Count(100, hit && (s.record.Flags & kPartDecalCutout) != 0);
+        Count(101, hit && decals.count > 0);
+        Count(102, hit && decalApplied);
+        Count(103, hit && decals.dropped > 0);
+        // Projected decals (ApplyProjectedDecals): hits inside one's box, changed by one, inside more than
+        // kMaxPointDecals; compared pixels one changed, of them those whose base color is within 0.05 and 0.02 of
+        // the G-buffer's (which the game's decal pass blended them into), whose normal is within 15 and 5 degrees.
+        bool projectedCompared = compared && projectedApplied > 0;
+        Count(104, hit && projectedMet > 0);
+        Count(105, hit && projectedApplied > 0);
+        Count(106, hit && projectedDropped);
+        Count(107, projectedCompared);
+        Count(108, projectedCompared && e.color < 0.05);
+        Count(109, projectedCompared && e.color < 0.02);
+        Count(110, projectedCompared && e.normalCosine > 0.9659);
+        Count(111, projectedCompared && e.normalCosine > 0.9962);
         bool fractional = deformed && any(frac(blockData.xy) != 0);
         MaterialError eNoOffset = (MaterialError)0;
         MaterialError eVertexFrame = (MaterialError)0;
@@ -1677,6 +2025,7 @@ void main(uint3 id : SV_DispatchThreadID)
             float specularHitDistance = kEscapedDistance;  // its length (Ray Reconstruction's guide)
             if (litPixel)
             {
+                material.normal = SeenSideNormal(material.normal, s.geometricNormal);
                 uint seed = Pcg(id.x + Pcg(id.y + Pcg(Frame)));
                 float distance = rayZ * length(direction);
                 float3 position = direction * rayZ + s.geometricNormal * (0.002 + 0.0005 * distance);
@@ -1688,13 +2037,13 @@ void main(uint3 id : SV_DispatchThreadID)
                 float3 diffuseLight = 0;
                 float3 specularLight = 0;
                 if (everything)
-                    SunLight(position, s.geometricNormal, material, V, seed, diffuseLight, specularLight);
+                    SunLight(position, s.geometricNormal, material, V, seed, diffuseLight, specularLight, openSelf);
                 // Emissive surfaces and lamps: next-event estimation (the diffuse bounce below leaves the
                 // listed emitters' light out; the game's lamp passes skip these pixels).
                 float3 sampledSpecular;
                 float3 sampledDiffuse = SampledLight(id.xy, direction * rayZ, previousPoint, position, material,
                                                      s.geometricNormal, V, indirectAO, seed, sampledSpecular,
-                                                     lightInfo);
+                                                     lightInfo, openSelf);
                 diffuseLight += sampledDiffuse;
                 float sampledLuminance = Luminance(sampledDiffuse);
                 sampledLimit = sampledLuminance > 64;
@@ -1711,7 +2060,7 @@ void main(uint3 id : SV_DispatchThreadID)
                     if (dot(diffuseDirection, s.geometricNormal) > 0)
                         bounce = indirectAO * IncomingLight(position, diffuseDirection, distance, coneSpread * 8,
                                                             Game.Light.ambientDiffuseFactor, lightInfo.inGrid, true,
-                                                            seed, bounceStatus, diffuseHitDistance);
+                                                            openSelf, seed, bounceStatus, diffuseHitDistance);
                     diffuseLight += bounce;
                     float bounceLuminance = Luminance(bounce);
                     float waveBounce = WaveActiveSum(bounceLuminance);
@@ -1730,8 +2079,8 @@ void main(uint3 id : SV_DispatchThreadID)
                         specularLight += specularWeight * indirectAO *
                                          IncomingLight(position, specularDirection, distance, coneSpread,
                                                        Game.Light.ambientSpecularFactor, false,
-                                                       Luminance(specularWeight) > kSpecularLightWeight, seed,
-                                                       specularStatus, specularHitDistance);
+                                                       Luminance(specularWeight) > kSpecularLightWeight, openSelf,
+                                                       seed, specularStatus, specularHitDistance);
                 }
                 // This frame's sample joins the history of the point it sees; glossy reflections, which move
                 // with the camera unlike the surface, keep a shorter one. Mode 11 hands this frame's light,
@@ -1779,6 +2128,14 @@ void main(uint3 id : SV_DispatchThreadID)
                 AlbedoEmission[id.xy] = float4(albedo, material.emissive * Game.Post.BloomEmissiveness);
                 specularHistory = float4(specularLight, min(moment, 60000));
                 color = albedo * (material.emissive * Game.Post.BloomEmissiveness + diffuseLight) + specularLight;
+                // 15, 63: this pixel's shadow rays that took the open-face pass (scene_common.hlsli Occluded); lit
+                // pixels seen through a face of their own object (openSelf; one atomic per wave).
+                uint2 openWave = WaveActiveSum(uint2(g_openFacePasses, openSelf != kNoInstance ? 1u : 0u));
+                if (WaveIsFirstLane() && (openWave.x | openWave.y) != 0)
+                {
+                    Stats.InterlockedAdd(15 * 4, openWave.x);
+                    Stats.InterlockedAdd(63 * 4, openWave.y);
+                }
             }
             else
             {

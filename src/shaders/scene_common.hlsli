@@ -80,6 +80,9 @@ cbuffer Primary : register(b0)
     float2 Jitter;          // the primary rays' sub-pixel offset (pixels, y down; full coverage only, else 0)
     uint FullCoverage;      // lit views in replace mode: every surface pixel the game drew takes the traced light
     float EmissiveIntensity;  // the EmissiveIntensity setting: the light emissive surfaces cast (not their glow)
+    uint DecalCount;        // the frame's projected decals (primary_view.hlsl ApplyProjectedDecals); 0: none
+    uint DecalLights;       // glowing decals light their surroundings (the DecalLights setting)
+    uint OpenGeneration;    // primary_view.hlsl SeenThrough: the entries holding it count (from 1, now and then on)
 };
 
 // The game's own frame constants (MyCommon.FrameConstantsData), as its shaders read them.
@@ -119,6 +122,15 @@ uint VertexStride(GeometryRecord r) { return r.Layout & 0xFF; }
 uint AttributeStride(GeometryRecord r) { return (r.Layout >> 8) & 0xFF; }
 uint Kind(GeometryRecord r) { return (r.Flags >> 8) & 0xFF; }
 
+// Part flags (GeometryRecord.Flags bits 0-7; scene.h): blended decals, the game's STATIC_DECAL parts. Never a hit
+// themselves: the rays look through them and blend them into the surface beneath (TraceClosestDecals).
+static const uint kPartDecal = 8;
+static const uint kPartDecalPremultiplied = 16;
+// Cutout decals (also alpha-masked): solid for the camera's rays only (scene.h).
+static const uint kPartDecalCutout = 32;
+
+bool IsDecal(GeometryRecord r) { return (r.Flags & kPartDecal) != 0; }
+
 uint3 LoadTriangle(GeometryRecord record, uint primitive)
 {
     ByteAddressBuffer page = Pages[NonUniformResourceIndex(record.Page)];
@@ -149,8 +161,13 @@ bool IsPosed(GeometryRecord r) { return r.Page == kPosedPage; }
 
 // With the CharacterLights setting off, characters' glowing suit parts glow where they are seen but light
 // nothing, as in the game: not listed as lights (emissive_lights.hlsl, lights.hlsli ListedLight), no emission
-// at a bounce's hit (primary_view.hlsl IncomingLight).
-bool GlowsOnly(GeometryRecord r) { return CharacterLights == 0 && IsPosed(r); }
+// at a bounce's hit (primary_view.hlsl IncomingLight); with DecalLights off, decals too. (Otherwise glowing
+// decals light their surroundings like any other emissive part, where their alpha mask covers them:
+// lights.hlsli Coverage.)
+bool GlowsOnly(GeometryRecord r)
+{
+    return (CharacterLights == 0 && IsPosed(r)) || (DecalLights == 0 && (r.Flags & (kPartDecal | kPartDecalCutout)) != 0);
+}
 
 // A posed skinned mesh keeps its previous frame's positions this many bytes after its own (layout bits
 // 18-31, 256-byte units); 0: none (every other mesh).
@@ -251,6 +268,8 @@ float Luminance(float3 c)
 RaytracingAccelerationStructure Scene : register(t4);
 
 static const uint kAlphamaskSlotNone = 0;  // the white fallback: no mask
+static const uint kFallbackSlots = 4;      // textures.h TextureFallback: slots below it are fallbacks, not a file's
+
 
 // Whether a candidate triangle is solid at its hit point (the game clips
 // alpha-masked parts below 0.5). `hiddenParts`: a main view's ray (the camera's
@@ -260,11 +279,13 @@ static const uint kAlphamaskSlotNone = 0;  // the white fallback: no mask
 // negative emissivity in its part override; registered non-opaque,
 // kPartHideable) is not there for it. It still casts shadows, as in the game.
 bool AlphaSolid(uint instanceIndex, uint instanceId, uint geometryIndex, uint primitive, float2 barycentrics,
-                float coneWidth, bool hiddenParts)
+                float coneWidth, bool hiddenParts, bool cameraRay = false)
 {
+    GeometryRecord record = Records[instanceId + geometryIndex];
+    if (IsDecal(record) || (!cameraRay && (record.Flags & kPartDecalCutout) != 0))
+        return false;  // a layer over a surface (cutout decals: but for the camera's rays), not in a ray's way
     if (hiddenParts && PartOverride(InstanceData[instanceIndex * 2 + 1], geometryIndex).a < 0)
         return false;
-    GeometryRecord record = Records[instanceId + geometryIndex];
     MaterialRecord material = Materials[record.Material];
     if (material.Textures.w == kAlphamaskSlotNone)
         return true;
@@ -294,25 +315,124 @@ RayQuery<RAY_FLAG_NONE> TraceClosest(RayDesc ray, uint flags, uint mask, float c
     return query;
 }
 
-// Shadow casters (instance mask 0x02) between origin + direction * minT and origin + direction * maxT.
-bool Occluded(float3 origin, float3 direction, float maxT, float minT = 0)
+// The blended decal a ray met on its way to its closest hit (TraceClosestDecals): the farthest one, which is the one
+// nearest the surface it stops at (the game's decals lie a few millimetres above their surfaces); `dropped` counts
+// the others. Its instance must be the hit's (a model's decals are parts of it): the caller uses the hit's transform.
+struct DecalHits
+{
+    uint count;          // 0 or 1
+    uint dropped;
+    uint record;         // index into Records
+    uint geometryIndex;  // the part in its mesh (PartOverride)
+    uint instanceIndex;
+    uint primitive;
+    float2 barycentrics;
+    float t;
+};
+
+// TraceClosest that also keeps the blended decals the ray met; which of them lie on the surface it stops at, the
+// caller decides (primary_view.hlsl ApplyDecals).
+RayQuery<RAY_FLAG_NONE> TraceClosestDecals(RayDesc ray, uint flags, uint mask, float coneSpread, out DecalHits decals)
+{
+    decals = (DecalHits)0;
+    RayQuery<RAY_FLAG_NONE> query;
+    query.TraceRayInline(Scene, flags, mask, ray);
+    while (query.Proceed())
+    {
+        if (query.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
+            continue;
+        uint recordIndex = query.CandidateInstanceID() + query.CandidateGeometryIndex();
+        GeometryRecord candidate = Records[recordIndex];
+        if (IsDecal(candidate))
+        {
+            // The game draws single-sided decals from the front only.
+            if (!query.CandidateTriangleFrontFace() && (candidate.Flags & 2) == 0)
+                continue;
+            float t = query.CandidateTriangleRayT();
+            if (decals.count != 0)
+            {
+                ++decals.dropped;
+                if (t <= decals.t)
+                    continue;  // the farther one stays
+            }
+            decals.count = 1;
+            decals.record = recordIndex;
+            decals.geometryIndex = query.CandidateGeometryIndex();
+            decals.instanceIndex = query.CandidateInstanceIndex();
+            decals.primitive = query.CandidatePrimitiveIndex();
+            decals.barycentrics = query.CandidateTriangleBarycentrics();
+            decals.t = t;
+            continue;
+        }
+        if (AlphaSolid(query.CandidateInstanceIndex(), query.CandidateInstanceID(), query.CandidateGeometryIndex(),
+                       query.CandidatePrimitiveIndex(), query.CandidateTriangleBarycentrics(),
+                       coneSpread * query.CandidateTriangleRayT(),
+                       (mask & 0x01) != 0 && query.CandidateInstanceContributionToHitGroupIndex() != 0, true))
+            query.CommitNonOpaqueTriangleHit();
+    }
+    return query;
+}
+
+static const uint kNoInstance = 0xFFFFFFFF;
+
+// A one-sided triangle of the ray's own object (TLAS instance `self`) met on its front: not in the way of light
+// leaving that object's surfaces. The camera sees through such a face from behind (the game culls back faces), so
+// a cavity modelled as an inward-facing box, whose lid closes it on the inside (the Collector's funnel throat), is
+// open to the camera but would be shut to all light. A closed shell still shadows its own surfaces: such a ray then
+// meets the shell from inside, on a back face; other objects' faces are in the way as before.
+bool OwnOpenFace(uint instanceIndex, uint instanceId, uint geometryIndex, bool frontFace, uint self)
+{
+    return instanceIndex == self && frontFace && (Records[instanceId + geometryIndex].Flags & 2) == 0;
+}
+
+static uint g_openFacePasses = 0;  // this thread's shadow rays that took the open-face pass (primary_view.hlsl 15)
+
+// Shadow casters (instance mask 0x02) between origin + direction * minT and origin + direction * maxT. `self`: the
+// TLAS instance of the surface the ray leaves when its open faces let light through (OwnOpenFace: the camera sees
+// that surface through one of them, primary_view.hlsl SeenThrough), else kNoInstance. Taken for every surface, the
+// rule cost RedShip's lit view ~1.1 ms and changed nothing there: about 3 % of its shadow rays met an own one-sided
+// face first, nearly all with their object's solid behind it, and a wave waits for its slowest ray.
+bool Occluded(float3 origin, float3 direction, float maxT, float minT = 0, uint self = kNoInstance)
 {
     RayDesc ray;
     ray.Origin = origin;
     ray.Direction = direction;
     ray.TMin = minT;
     ray.TMax = maxT;
-    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> query;
-    query.TraceRayInline(Scene, RAY_FLAG_NONE, 0x02, ray);
-    while (query.Proceed())
+    // Pass 0 takes the faces opaque as built. When the caster it finds is an open face of the ray's own object, pass
+    // 1 makes every face a candidate: such faces are passed, any other stops the ray (whichever is met first: the
+    // answer is only whether there is one). The two passes share one query and one candidate loop: the lit view
+    // inlines this four times over.
+    uint forced = RAY_FLAG_NONE;
+    [loop]
+    for (uint pass = 0; pass < 2; ++pass)
     {
-        if (query.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE &&
-            AlphaSolid(query.CandidateInstanceIndex(), query.CandidateInstanceID(), query.CandidateGeometryIndex(),
-                       query.CandidatePrimitiveIndex(), query.CandidateTriangleBarycentrics(),
-                       0.001 * query.CandidateTriangleRayT(), false))
-            query.CommitNonOpaqueTriangleHit();
+        RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> query;
+        query.TraceRayInline(Scene, forced, 0x02, ray);
+        while (query.Proceed())
+        {
+            if (query.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
+                continue;
+            uint instanceIndex = query.CandidateInstanceIndex();
+            uint instanceId = query.CandidateInstanceID();
+            uint geometryIndex = query.CandidateGeometryIndex();
+            if (pass != 0 &&
+                OwnOpenFace(instanceIndex, instanceId, geometryIndex, query.CandidateTriangleFrontFace(), self))
+                continue;
+            if (AlphaSolid(instanceIndex, instanceId, geometryIndex, query.CandidatePrimitiveIndex(),
+                           query.CandidateTriangleBarycentrics(), 0.001 * query.CandidateTriangleRayT(), false))
+                query.CommitNonOpaqueTriangleHit();
+        }
+        if (query.CommittedStatus() == COMMITTED_NOTHING)
+            return false;
+        if (pass != 0 || self == kNoInstance ||
+            !OwnOpenFace(query.CommittedInstanceIndex(), query.CommittedInstanceID(), query.CommittedGeometryIndex(),
+                         query.CommittedTriangleFrontFace(), self))
+            return true;
+        ++g_openFacePasses;
+        forced = RAY_FLAG_FORCE_NON_OPAQUE;
     }
-    return query.CommittedStatus() != COMMITTED_NOTHING;
+    return true;
 }
 
 #endif

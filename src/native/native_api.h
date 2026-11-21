@@ -32,14 +32,18 @@ struct RtOptions {
     // surfaces cast (not their own glow); 1 = as the game sets them.
     float lampIntensity;
     float emissiveIntensity;
+    // Glowing decals (indicator lights, signs) light their surroundings (1) or
+    // only glow where they are seen (0).
+    std::int32_t decalLights;
 };
 
-static_assert(sizeof(RtOptions) == 40);
+static_assert(sizeof(RtOptions) == 48);
 static_assert(offsetof(RtOptions, tracePath) == 16);
 static_assert(offsetof(RtOptions, denoiser) == 24);
 static_assert(offsetof(RtOptions, characterLights) == 28);
 static_assert(offsetof(RtOptions, lampIntensity) == 32);
 static_assert(offsetof(RtOptions, emissiveIntensity) == 36);
+static_assert(offsetof(RtOptions, decalLights) == 40);
 
 // Function table handed to the managed side; its address travels in the
 // argument of the managed entry point. The layout is mirrored in
@@ -94,10 +98,15 @@ struct NativeApi {
     // (rt::kBoneFloats floats each) and part palettes (rt::SceneSubmitSkins; copied).
     void(__cdecl* rtSkinsSubmit)(const void* skins, std::uint32_t skinCount, const float* bones,
                                  std::uint32_t boneCount, const std::uint32_t* palettes, std::uint32_t paletteCount);
+    // The projected decals of the next frame (rt::RtDecal[count], copied).
+    void(__cdecl* rtDecalsSubmit)(const void* decals, std::uint32_t count);
+    // Whether glowing decals light their surroundings (1) or only glow (0),
+    // from the next frame on; starts a fresh statistics window.
+    void(__cdecl* rtSetDecalLights)(int on);
 };
 
 // The managed side reads the table by these offsets (NativeApi.cs).
-static_assert(sizeof(NativeApi) == 216);
+static_assert(sizeof(NativeApi) == 232);
 static_assert(offsetof(NativeApi, createHook) == 8);
 static_assert(offsetof(NativeApi, applyQueued) == 16);
 static_assert(offsetof(NativeApi, removeHook) == 24);
@@ -124,6 +133,8 @@ static_assert(offsetof(NativeApi, rtVoxelMaterials) == 184);
 static_assert(offsetof(NativeApi, rtSetEnvironment) == 192);
 static_assert(offsetof(NativeApi, rtLightsSubmit) == 200);
 static_assert(offsetof(NativeApi, rtSkinsSubmit) == 208);
+static_assert(offsetof(NativeApi, rtDecalsSubmit) == 216);
+static_assert(offsetof(NativeApi, rtSetDecalLights) == 224);
 
 [[nodiscard]] bool InitializeHooking();
 [[nodiscard]] const NativeApi* GetNativeApi();

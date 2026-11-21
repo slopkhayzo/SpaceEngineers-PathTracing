@@ -78,6 +78,7 @@ int __cdecl RtInitialize(void* d3d11Device, const RtOptions* options) {
         parsed.characterLights = options->characterLights != 0;
         parsed.lampIntensity = options->lampIntensity;
         parsed.emissiveIntensity = options->emissiveIntensity;
+        parsed.decalLights = options->decalLights != 0;
         parsed.tracePath = options->tracePath != nullptr ? options->tracePath : L"";
         return rt::Initialize(static_cast<ID3D11Device*>(d3d11Device), parsed);
     } catch (...) {
@@ -244,6 +245,18 @@ void __cdecl RtSkinsSubmit(const void* skins, const std::uint32_t skinCount, con
     }
 }
 
+void __cdecl RtDecalsSubmit(const void* decals, const std::uint32_t count) {
+    try {
+        rt::SceneSubmitDecals(static_cast<const rt::RtDecal*>(decals), count);
+    } catch (...) {
+        log::Write(log::Level::error, L"RT core: exception while submitting the projected decals.");
+    }
+}
+
+void __cdecl RtSetDecalLights(const int on) {
+    rt::SetDecalLights(on != 0);
+}
+
 const NativeApi g_api{
     sizeof(NativeApi),
     SE_RTHWACCEL_API_VERSION,
@@ -273,6 +286,8 @@ const NativeApi g_api{
     &RtSetEnvironment,
     &RtLightsSubmit,
     &RtSkinsSubmit,
+    &RtDecalsSubmit,
+    &RtSetDecalLights,
 };
 
 } // namespace

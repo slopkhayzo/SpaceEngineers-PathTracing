@@ -3,8 +3,9 @@
 // §6.9; lights.hlsli describes the buffers). One dispatch per step
 // (rt_core.cpp BuildLights), by Pass:
 //   0 materials: whether each material can emit (the most emission over
-//     32x32 points of its extensions texture at a coarse mip) and its mean
-//     emitted luminance; only when the material table changed
+//     32x32 points of its extensions texture at a coarse mip, an alpha-masked
+//     one's within its mask) and its mean emitted luminance; only when the
+//     material table changed
 //   1 reset: the counters, the key table and the cells' lists
 //   2 parts: per TLAS instance drawn in the main view, its parts whose
 //     material can emit, each with its range of the triangle list
@@ -98,6 +99,9 @@ void MaterialPass(uint material, uint thread)
     MaterialRecord m = Materials[material];
     float colorLevel = CoarseLevel(m.Textures.x);
     float extensionsLevel = CoarseLevel(m.Textures.z);
+    // An alpha-masked material (cutout decals among them) emits where its mask leaves it (lights.hlsli Coverage).
+    bool masked = (m.Flags & 1) != 0 && m.Textures.w != kAlphamaskSlotNone;
+    float maskLevel = masked ? CoarseLevel(m.Textures.w) : 0;
     float most = 0;
     float sum = 0;
     for (uint i = thread; i < kMaterialPoints * kMaterialPoints; i += GROUP_SIZE)
@@ -106,6 +110,8 @@ void MaterialPass(uint material, uint thread)
         float4 cm = Textures[NonUniformResourceIndex(m.Textures.x)].SampleLevel(LinearWrap, uv, colorLevel);
         float4 ext = Textures[NonUniformResourceIndex(m.Textures.z)].SampleLevel(LinearWrap, uv, extensionsLevel);
         float emissive = saturate(ext.y - 1 / 255.0);
+        if (masked)
+            emissive *= Textures[NonUniformResourceIndex(m.Textures.w)].SampleLevel(LinearWrap, uv, maskLevel).r;
         most = max(most, emissive);
         sum += Luminance(cm.rgb * (1 - cm.a)) * emissive;
     }

@@ -201,6 +201,7 @@ endforeach()
 set(SERT_MANAGED_SOURCES
     src/managed/Compiled.cs
     src/managed/DebugAutomation.cs
+    src/managed/DecalMirror.cs
     src/managed/Detour.cs
     src/managed/FreeCamera.cs
     src/managed/GameFrame.cs
@@ -289,6 +290,7 @@ set(SERT_TEST_SOURCES
     src/managed/Settings.cs
     # The scene mirror's member lookups, resolved against the installed game.
     src/managed/Compiled.cs
+    src/managed/DecalMirror.cs
     src/managed/Detour.cs
     src/managed/GameFrame.cs
     src/managed/GameReflection.cs

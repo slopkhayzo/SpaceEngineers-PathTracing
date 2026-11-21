@@ -29,7 +29,7 @@ constexpr std::size_t kMaxMeshesPerGate = 256;
 // Long-lived memory.
 constexpr UINT64 kPageBytes = 256ull << 20;
 constexpr std::uint32_t kMaxBlasPages = 16;
-constexpr std::uint32_t kMaxRecords = 1u << 20;
+constexpr std::uint32_t kMaxRecords = kMaxGeometryRecords;
 constexpr std::uint32_t kCubeStride = 64;     // MyVertexFormatCubeInstance
 constexpr std::uint32_t kGenericStride = 32;  // MyVertexFormatGenericInstance
 constexpr UINT64 kBlockAlignment = 64;
@@ -337,6 +337,9 @@ struct Stats {
     UINT64 skinsCreated = 0;
     UINT64 skinsReleased = 0;
     UINT64 skinRebuilds = 0;  // full BLAS builds of poses (the rest are refits)
+    UINT64 decals = 0;          // projected decals traced, sums over the frames
+    UINT64 decalsSubmitted = 0;
+    UINT64 decalsDropped = 0;   // no room in the upload slice
 };
 
 // This frame's slice of the upload buffer.
@@ -459,6 +462,15 @@ struct State {
     std::vector<float> overrides;  // SceneSubmit's part overrides (float4 each, in description order)
     std::vector<float> remapped;   // this frame's, per record of the instances that have them
     std::vector<RtLight> lights;   // SceneSubmitLights
+    std::vector<RtDecal> decals;   // SceneSubmitDecals
+    // The projected decals' acceleration structures (UploadDecals), sized for kMaxDecals at first use: a BLAS of
+    // procedural boxes and a TLAS with its one instance, rebuilt every frame; the scratch holds both builds' (the
+    // TLAS's from decalScratchTop).
+    ComPtr<ID3D12Resource> decalBlas;
+    ComPtr<ID3D12Resource> decalTlas;
+    ComPtr<ID3D12Resource> decalScratch;
+    UINT64 decalScratchTop = 0;
+    bool decalsFailed = false;
     Stats stats;
     int loggedFailures = 0;
 };
@@ -615,7 +627,7 @@ void FillGeometries(const Mesh& mesh, const D3D12_GPU_VIRTUAL_ADDRESS indices,
         D3D12_RAYTRACING_GEOMETRY_DESC geometry{};
         geometry.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
         // Alpha-masked parts are tested by the rays (primary_view.hlsl); the rest is opaque.
-        geometry.Flags = (part.flags & (kPartAlphaMasked | kPartHideable)) != 0 ? D3D12_RAYTRACING_GEOMETRY_FLAG_NONE
+        geometry.Flags = (part.flags & kPartNonOpaque) != 0 ? D3D12_RAYTRACING_GEOMETRY_FLAG_NONE
                                                                                  : D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
         geometry.Triangles.IndexFormat = mesh.indexSize == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
         geometry.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
@@ -936,7 +948,7 @@ void SkinGeometries(const Skin& skin, const Mesh& geometry, std::vector<D3D12_RA
     for (const RtMeshPart& part : geometry.parts) {
         D3D12_RAYTRACING_GEOMETRY_DESC desc{};
         desc.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
-        desc.Flags = (part.flags & (kPartAlphaMasked | kPartHideable)) != 0 ? D3D12_RAYTRACING_GEOMETRY_FLAG_NONE
+        desc.Flags = (part.flags & kPartNonOpaque) != 0 ? D3D12_RAYTRACING_GEOMETRY_FLAG_NONE
                                                                              : D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
         desc.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
         desc.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
@@ -1730,6 +1742,195 @@ void UploadLamps(Upload& upload, const double camera[3], SceneFrame& frame) {
     s.stats.lamps += count;
 }
 
+// Mirrors struct ProjectedDecal in src/shaders/primary_view.hlsl.
+struct GpuDecal {
+    float toBox[3][4];       // camera-relative world -> the box: box[j] = dot(toBox[j].xyz, p) + toBox[j].w
+    float axis[3];           // the box's -z, unit: the direction the game projects the decal along
+    float fade;
+    std::uint32_t material;  // into the material table
+    std::uint32_t maps;      // kDecal*
+    std::uint32_t padding[2];
+};
+static_assert(sizeof(GpuDecal) == 80);
+
+constexpr D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS kDecalBuildFlags =
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD;
+
+D3D12_RAYTRACING_GEOMETRY_DESC DecalGeometry(const std::uint32_t count, const D3D12_GPU_VIRTUAL_ADDRESS boxes) {
+    D3D12_RAYTRACING_GEOMETRY_DESC geometry{};
+    geometry.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_PROCEDURAL_PRIMITIVE_AABBS;
+    // Each box is met once per ray (the shader counts and blends what it meets).
+    geometry.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_NO_DUPLICATE_ANYHIT_INVOCATION;
+    geometry.AABBs.AABBCount = count;
+    geometry.AABBs.AABBs.StartAddress = boxes;
+    geometry.AABBs.AABBs.StrideInBytes = sizeof(D3D12_RAYTRACING_AABB);
+    return geometry;
+}
+
+bool EnsureDecalStructures() {
+    if (s.decalTlas) {
+        return true;
+    }
+    if (s.decalsFailed) {
+        return false;
+    }
+    const D3D12_RAYTRACING_GEOMETRY_DESC geometry = DecalGeometry(kMaxDecals, 0);
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS bottom{};
+    bottom.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+    bottom.Flags = kDecalBuildFlags;
+    bottom.NumDescs = 1;
+    bottom.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    bottom.pGeometryDescs = &geometry;
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO bottomInfo{};
+    s.devices.d3d12dxr->GetRaytracingAccelerationStructurePrebuildInfo(&bottom, &bottomInfo);
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS top{};
+    top.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+    top.Flags = kDecalBuildFlags;
+    top.NumDescs = 1;
+    top.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO topInfo{};
+    s.devices.d3d12dxr->GetRaytracingAccelerationStructurePrebuildInfo(&top, &topInfo);
+    ID3D12Device* device = s.devices.d3d12.Get();
+    s.decalBlas = CreateBuffer(device, AlignUp(bottomInfo.ResultDataMaxSizeInBytes, kAlignment), D3D12_HEAP_TYPE_DEFAULT,
+                               D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                               D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
+    s.decalTlas = CreateBuffer(device, AlignUp(topInfo.ResultDataMaxSizeInBytes, kAlignment), D3D12_HEAP_TYPE_DEFAULT,
+                               D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                               D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
+    s.decalScratchTop = AlignUp(bottomInfo.ScratchDataSizeInBytes, kAlignment);
+    s.decalScratch = CreateBuffer(device, s.decalScratchTop + AlignUp(topInfo.ScratchDataSizeInBytes, kAlignment),
+                                  D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                  D3D12_RESOURCE_STATE_COMMON);
+    if (!s.decalBlas || !s.decalTlas || !s.decalScratch) {
+        Error(L"scene: the projected decals' acceleration structures could not be created; they are left out.");
+        s.decalBlas.Reset();
+        s.decalTlas.Reset();
+        s.decalScratch.Reset();
+        s.decalsFailed = true;
+        return false;
+    }
+    Info(Format(L"scene: projected decals: up to %u, %llu KB of acceleration structures.", kMaxDecals,
+                static_cast<unsigned long long>((bottomInfo.ResultDataMaxSizeInBytes + topInfo.ResultDataMaxSizeInBytes +
+                                                 bottomInfo.ScratchDataSizeInBytes + topInfo.ScratchDataSizeInBytes) >>
+                                                10)));
+    return true;
+}
+
+// The frame's projected decals (SceneSubmitDecals) around `camera`: per decal its record (the inverse of its world
+// matrix, its axis, fade, material and maps) and the world box around its oriented box, a procedural primitive of
+// the decals' BLAS (built anew every frame: few, and on moving grids), under a TLAS of one instance. Decals whose
+// material the GPU table does not hold yet are left out for the frame.
+void UploadDecals(ID3D12GraphicsCommandList4* list, Upload& upload, const double camera[3], SceneFrame& frame) {
+    const std::size_t submitted = std::min<std::size_t>(s.decals.size(), kMaxDecals);
+    s.stats.decalsSubmitted += s.decals.size();
+    if (submitted == 0 || !EnsureDecalStructures()) {
+        return;
+    }
+    const UINT64 recordsOffset = upload.Allocate(submitted * sizeof(GpuDecal), 16);
+    const UINT64 boxesOffset = upload.Allocate(submitted * sizeof(D3D12_RAYTRACING_AABB),
+                                               D3D12_RAYTRACING_AABB_BYTE_ALIGNMENT);
+    const UINT64 instanceOffset = upload.Allocate(sizeof(D3D12_RAYTRACING_INSTANCE_DESC),
+                                                  D3D12_RAYTRACING_INSTANCE_DESCS_BYTE_ALIGNMENT);
+    if (recordsOffset == kNoSpace || boxesOffset == kNoSpace || instanceOffset == kNoSpace) {
+        s.stats.decalsDropped += submitted;
+        return;
+    }
+    std::uint32_t count = 0;
+    for (std::size_t index = 0; index < submitted; ++index) {
+        const RtDecal& decal = s.decals[index];
+        if (!(decal.fade > 0) || decal.material >= s.materialsWritten) {
+            continue;
+        }
+        // The box: local l to world l M + t (row vectors), M's rows its axes, t its centre around the camera.
+        double m[3][3];
+        double t[3];
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) {
+                m[r][c] = decal.rotation[r * 3 + c];
+            }
+            t[r] = decal.translation[r] - camera[r];
+        }
+        const double det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -
+                           m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+                           m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+        const double zLength = std::sqrt(m[2][0] * m[2][0] + m[2][1] * m[2][1] + m[2][2] * m[2][2]);
+        if (!(std::abs(det) > 1e-12) || !(zLength > 0)) {
+            continue;
+        }
+        double inv[3][3];
+        inv[0][0] = (m[1][1] * m[2][2] - m[1][2] * m[2][1]) / det;
+        inv[0][1] = (m[0][2] * m[2][1] - m[0][1] * m[2][2]) / det;
+        inv[0][2] = (m[0][1] * m[1][2] - m[0][2] * m[1][1]) / det;
+        inv[1][0] = (m[1][2] * m[2][0] - m[1][0] * m[2][2]) / det;
+        inv[1][1] = (m[0][0] * m[2][2] - m[0][2] * m[2][0]) / det;
+        inv[1][2] = (m[0][2] * m[1][0] - m[0][0] * m[1][2]) / det;
+        inv[2][0] = (m[1][0] * m[2][1] - m[1][1] * m[2][0]) / det;
+        inv[2][1] = (m[0][1] * m[2][0] - m[0][0] * m[2][1]) / det;
+        inv[2][2] = (m[0][0] * m[1][1] - m[0][1] * m[1][0]) / det;
+        // l = (p - t) M^-1: l_j = sum_i (p - t)_i inv[i][j].
+        GpuDecal gpu{};
+        float low[3];
+        float high[3];
+        for (int j = 0; j < 3; ++j) {
+            double offset = 0;
+            for (int i = 0; i < 3; ++i) {
+                gpu.toBox[j][i] = static_cast<float>(inv[i][j]);
+                offset -= t[i] * inv[i][j];
+            }
+            gpu.toBox[j][3] = static_cast<float>(offset);
+            gpu.axis[j] = static_cast<float>(-m[2][j] / zLength);
+            // Along world axis j the box reaches half of each axis's extent.
+            const double half = 0.5 * (std::abs(m[0][j]) + std::abs(m[1][j]) + std::abs(m[2][j]));
+            low[j] = static_cast<float>(t[j] - half);
+            high[j] = static_cast<float>(t[j] + half);
+        }
+        gpu.fade = std::min(decal.fade, 1.0f);
+        gpu.material = decal.material;
+        gpu.maps = decal.maps;
+        const D3D12_RAYTRACING_AABB box{low[0], low[1], low[2], high[0], high[1], high[2]};
+        std::memcpy(upload.cpu + recordsOffset + count * sizeof(GpuDecal), &gpu, sizeof(gpu));
+        std::memcpy(upload.cpu + boxesOffset + count * sizeof(box), &box, sizeof(box));
+        ++count;
+    }
+    if (count == 0) {
+        return;
+    }
+    D3D12_RAYTRACING_INSTANCE_DESC instance{};
+    instance.Transform[0][0] = 1.0f;
+    instance.Transform[1][1] = 1.0f;
+    instance.Transform[2][2] = 1.0f;
+    instance.InstanceMask = 0xFF;
+    instance.AccelerationStructure = s.decalBlas->GetGPUVirtualAddress();
+    std::memcpy(upload.cpu + instanceOffset, &instance, sizeof(instance));
+
+    Transition(list, s.decalScratch.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    const D3D12_RAYTRACING_GEOMETRY_DESC geometry = DecalGeometry(count, upload.gpu + boxesOffset);
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC bottom{};
+    bottom.DestAccelerationStructureData = s.decalBlas->GetGPUVirtualAddress();
+    bottom.Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+    bottom.Inputs.Flags = kDecalBuildFlags;
+    bottom.Inputs.NumDescs = 1;
+    bottom.Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    bottom.Inputs.pGeometryDescs = &geometry;
+    bottom.ScratchAccelerationStructureData = s.decalScratch->GetGPUVirtualAddress();
+    list->BuildRaytracingAccelerationStructure(&bottom, 0, nullptr);
+    UavBarrier(list, s.decalBlas.Get());
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC top{};
+    top.DestAccelerationStructureData = s.decalTlas->GetGPUVirtualAddress();
+    top.Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+    top.Inputs.Flags = kDecalBuildFlags;
+    top.Inputs.NumDescs = 1;
+    top.Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    top.Inputs.InstanceDescs = upload.gpu + instanceOffset;
+    top.ScratchAccelerationStructureData = s.decalScratch->GetGPUVirtualAddress() + s.decalScratchTop;
+    list->BuildRaytracingAccelerationStructure(&top, 0, nullptr);
+    UavBarrier(list, s.decalTlas.Get());
+    frame.decalTlas = s.decalTlas->GetGPUVirtualAddress();
+    frame.decals = upload.gpu + recordsOffset;
+    frame.decalCount = count;
+    s.stats.decals += count;
+}
+
 ComPtr<ID3D12RootSignature> CreateRootSignature(const D3D12_ROOT_PARAMETER* parameters, const UINT count) {
     const D3D12_ROOT_SIGNATURE_DESC desc{count, parameters, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
     ComPtr<ID3DBlob> blob;
@@ -1987,7 +2188,8 @@ std::uint32_t SceneCreateMaterial(const RtMaterialDesc& desc) {
             return 0;
         }
     }
-    // Texture requests outside the scene lock (they take the texture lock).
+    // Texture requests outside the scene lock (they take the texture lock). Every slot but the normal-gloss map
+    // is viewed as sRGB, as the game views them (textures.cpp).
     constexpr TextureFallback kFallbacks[4] = {TextureFallback::black, TextureFallback::normal,
                                                TextureFallback::extensions, TextureFallback::white};
     State::Material material;
@@ -1997,7 +2199,7 @@ std::uint32_t SceneCreateMaterial(const RtMaterialDesc& desc) {
             material.textures[slot] =
                 TextureRequestDynamic(static_cast<ID3D11Resource*>(desc.rendered[slot]), kFallbacks[slot]);
         } else if (desc.textures[slot] != nullptr && desc.textures[slot][0] != L'\0') {
-            material.textures[slot] = TextureRequest(desc.textures[slot], slot == 0, kFallbacks[slot]);
+            material.textures[slot] = TextureRequest(desc.textures[slot], slot != 1, kFallbacks[slot]);
         }
     }
     Exclusive lock;
@@ -2133,7 +2335,7 @@ void SceneSetVoxelMaterials(const RtVoxelMaterial* materials, const std::uint32_
         for (std::size_t t = 0; t < table[i].textures.size(); ++t) {
             const wchar_t* path = materials[i].textures[t];
             const bool used = materials[i].colorFar3[3] != 0.0f && path != nullptr && path[0] != L'\0';
-            // ColorMetal and Extensions are sRGB files (the loader follows a DX10 header's own format).
+            // ColorMetal and Extensions are viewed as sRGB, as the game views them (textures.cpp).
             table[i].textures[t] =
                 used ? TextureRequest(path, t / 6 != 1, t / 6 == 0 ? TextureFallback::black
                                                         : t / 6 == 1 ? TextureFallback::normal
@@ -2236,6 +2438,11 @@ void SceneSubmitLights(const RtLight* lights, const std::uint32_t count) {
     s.lights.assign(lights, lights + (lights != nullptr ? count : 0));
 }
 
+void SceneSubmitDecals(const RtDecal* decals, const std::uint32_t count) {
+    Exclusive lock;
+    s.decals.assign(decals, decals + (decals != nullptr ? count : 0));
+}
+
 void SceneCopyIn(ID3D11DeviceContext* immediate) {
     if (!s.ready) {
         return;
@@ -2314,6 +2521,7 @@ SceneFrame SceneRecord(ID3D12GraphicsCommandList4* list, const std::size_t slot,
     SceneFrame frame = BuildTopLevel(list, upload, camera, previousCamera);
     if (frame.tlas != 0) {
         UploadLamps(upload, camera, frame);
+        UploadDecals(list, upload, camera, frame);
     }
     ++s.stats.frames;
     return frame;
@@ -2396,6 +2604,12 @@ void SceneReport() {
                     static_cast<unsigned long long>(st.skinsReleased),
                     static_cast<unsigned long long>(st.skinRebuilds), s.skins.size(),
                     static_cast<unsigned long long>(s.skinnedAllocator.Used() >> 10)));
+    }
+    if (st.decalsSubmitted != 0) {
+        Info(Format(L"scene: projected decals per frame: %.1f submitted, %.1f traced; %llu left out for lack of upload "
+                    L"room this window.",
+                    static_cast<double>(st.decalsSubmitted) / frames, static_cast<double>(st.decals) / frames,
+                    static_cast<unsigned long long>(st.decalsDropped)));
     }
     st = Stats{};
 }

@@ -443,18 +443,34 @@ float3 LightNormal(LightTriangle light)
     return (asuint(light.uv2.z) & kLightFlipped) != 0 ? -n : n;
 }
 
+// The share of a part there at a point, at the coarse mip emission is read at (LightLodBase): an alpha-masked
+// part's (cutout decals among them) and a blended decal's alpha mask (premultiplied decals carry it in their
+// textures already); 1 for the others. The light of a glowing marking comes from the marking alone, not from the
+// whole quad it is drawn on.
+float Coverage(GeometryRecord record, MaterialRecord material, float2 uv, float lodBase)
+{
+    if (material.Textures.w == kAlphamaskSlotNone || (record.Flags & kPartDecalPremultiplied) != 0 ||
+        ((material.Flags & 1) == 0 && !IsDecal(record)))
+        return 1;
+    return SampleTexture(material.Textures.w, uv, lodBase).r;
+}
+
 // What a point of an emissive part sends out: the game's emissive term
 // (albedo x emissive x BloomEmissiveness; Lighting/LightDir.hlsl) with its
 // paint, the object's color and emissivity for the part (PartOverride) and the
 // material multipliers (FeedOutputInternal, ApplyMultipliers), as
 // primary_view.hlsl's ShadeMaterial computes them, from the textures at
-// `lodBase` (TextureLod), times the EmissiveIntensity setting: the light it
-// casts (sampled here and in the list's estimate), not its glow where it is
-// seen. `instance`, `extra`: the TLAS instance's two InstanceData entries.
+// `lodBase` (TextureLod), times the EmissiveIntensity setting and the share of
+// the part there (Coverage): the light it casts (sampled here and in the list's
+// estimate), not its glow where it is seen. `instance`, `extra`: the TLAS
+// instance's two InstanceData entries.
 // Not yet: deformed cube blocks' pattern offset.
 float3 Emission(GeometryRecord record, float4 instance, float4 extra, uint geometryIndex, float2 uv, float lodBase)
 {
     MaterialRecord material = Materials[record.Material];
+    float coverage = Coverage(record, material, uv, lodBase);
+    if (coverage <= 0)
+        return 0;
     float4 cm = SampleTexture(material.Textures.x, uv, lodBase);
     float4 ext = SampleTexture(material.Textures.z, uv, lodBase);
     float4 part = PartOverride(extra, geometryIndex);
@@ -465,7 +481,7 @@ float3 Emission(GeometryRecord record, float4 instance, float4 extra, uint geome
     float3 baseColor = Paint(cm.rgb, instance.xyz, coloring) * part.rgb * Multipliers0.x + Multipliers1.z;
     float metalness = cm.a * Multipliers0.y + Multipliers1.w;
     float emissive = saturate(ext.y - 1 / 255.0) * part.a * Multipliers1.x + Multipliers2.z;
-    return max(baseColor * (1 - metalness) * emissive * Game.Post.BloomEmissiveness * EmissiveIntensity, 0);
+    return max(baseColor * (1 - metalness) * emissive * Game.Post.BloomEmissiveness * EmissiveIntensity, 0) * coverage;
 }
 
 // The LOD base (TextureLod) at which a triangle spans about kLightTexels texels.

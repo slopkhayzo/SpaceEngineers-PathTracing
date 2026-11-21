@@ -233,7 +233,6 @@ bool ParseDds(Texture& t, const wchar_t*& error) {
     }
     std::size_t offset = 4 + sizeof(DdsHeader);
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
-    bool dx10Present = false;
     const DdsPixelFormat& pf = header.pixelFormat;
     if ((pf.flags & kPixelFormatFourCc) != 0) {
         switch (pf.fourCc) {
@@ -275,7 +274,6 @@ bool ParseDds(Texture& t, const wchar_t*& error) {
                 return false;
             }
             format = static_cast<DXGI_FORMAT>(dx10.dxgiFormat);
-            dx10Present = true;
             break;
         }
         default:
@@ -296,11 +294,13 @@ bool ParseDds(Texture& t, const wchar_t*& error) {
         return false;
     }
     t.format = info.resource;
-    // A DX10 header says whether the texels are sRGB (the game's _cm files:
-    // BC7_UNORM_SRGB, _ng and _add: BC7_UNORM); legacy headers cannot, so
-    // the caller's hint decides there.
+    // The game views every file texture but its normal maps as sRGB, whatever
+    // the header declares (MyFileTexture.Load: MakeSrgb unless the texture is
+    // NORMALMAP_GLOSS; the decals' _cm files and some _add files are declared
+    // BC7_UNORM): the caller's `srgb` is the texture's role. A header that
+    // declares sRGB is sRGB in any case, as in the game.
     const bool declaredSrgb = info.srgb != info.linear && format == info.srgb;
-    t.viewFormat = declaredSrgb || (t.srgb && !dx10Present) ? info.srgb : info.linear;
+    t.viewFormat = declaredSrgb || t.srgb ? info.srgb : info.linear;
     t.blockBytes = info.blockBytes;
     t.compressed = info.compressed;
     t.width = header.width;

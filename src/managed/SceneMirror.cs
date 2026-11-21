@@ -31,6 +31,7 @@ namespace SpaceEngineers.RTHWAccel
     //     expanded into TLAS instances on the GPU; geometry per LOD mesh.
     //   Voxel cells (MyComponentFactory's MyVoxelCellComponent pool).
     //   Lamps: the point and spot lights (LampMirror).
+    //   Projected decals: bullet holes, impact marks, trails (DecalMirror).
     //   Skinned renderables (characters): their LOD mesh with the bone
     //     matrices of the frame; the native core poses it on the GPU.
     //
@@ -39,7 +40,9 @@ namespace SpaceEngineers.RTHWAccel
     // used it for a while or its buffers changed. Old-pipeline renderables bind
     // their own materials (block skins): one whose materials differ from those
     // its mesh was registered with gets a variant of the mesh (same geometry
-    // and BLAS, its own geometry records). Not mirrored yet: static groups,
+    // and BLAS, its own geometry records). A GeometryStage2 instance with a
+    // skin (armor panels, interior walls) draws its model instance's textures:
+    // a variant of its LOD's mesh likewise. Not mirrored yet: static groups,
     // transparent parts, grass.
     internal static unsafe class SceneMirror
     {
@@ -56,6 +59,7 @@ namespace SpaceEngineers.RTHWAccel
         private const int TechniqueAlphaMasked = 3;
         private const int TechniqueAlphaMaskedSingleSided = 4;
         private const int TechniqueDecal = 6;
+        private const int TechniqueDecalNoPremult = 7;
         private const int TechniqueDecalCutout = 8;
         private const int TechniqueHolo = 9;
         private const int TechniqueGlass = 15;
@@ -105,6 +109,15 @@ namespace SpaceEngineers.RTHWAccel
         private static Func<object, int> s_partMaterialOffset;   // MyPreprocessedPart.InstanceMaterialOffsetWithinLod
         private static Func<object, IList> s_lodMaterialOffsets; // MyLod.GetInstanceMaterialOffsets()
         private static Func<object, int, Vector4> s_instanceMaterial;
+        // Skins on GeometryStage2 instances (armor panels, interior walls...: MyInstance.AddTextureChanges): the model
+        // instance an instance draws with (MyModel.GetInstance(changes), shared by the instances with the same
+        // changes), its texture changes (null or empty: the model's own materials) and per LOD its parts' bindings
+        // (MyLodInstance.GBufferParts: the LOD's GBufferParts in their order, the changes applied).
+        private static Func<object, object> s_skinnedModelInstance;  // MyInstance.ModelInstance if it has changes, else null
+        private static Func<object, object[]> s_modelInstanceLods;    // MyModelInstance.LodInstances
+        private static Func<object, int, object[]> s_lodInstanceSrvs;     // MyLodInstance.GBufferParts[i].Srvs, or null
+        private static Func<object, int, object> s_lodInstanceAlphamask;  // MyLodInstance.GBufferParts[i].SrvAlphamask, or null
+        private static readonly object[] s_boundTextures = new object[4];
         private static Func<int, object[]> s_proxyTextures;   // MyMaterials1.ProxyPool.Data[i].MaterialSrvs.Srvs
         private static Type s_fileTextureType;                // MyFileTexture: what a texture slot holds when it is a file
         private static Func<object, string> s_texturePath;    // MyFileTexture.m_path (absolute)
@@ -234,6 +247,18 @@ namespace SpaceEngineers.RTHWAccel
             public int LastSeen;
         }
 
+        // A skinned model instance's LOD: the mesh (handle) it was resolved for, the variant drawn, the LOD's
+        // GBufferParts indices of the registered parts and the four textures each was resolved with (the game swaps
+        // them as they stream in or out: compared once per frame).
+        private sealed class SkinnedLodEntry
+        {
+            public uint Mesh;
+            public uint Handle;
+            public int LastSeen;
+            public int[] Parts;
+            public object[] Bound;
+        }
+
         private sealed class ReferenceComparer : IEqualityComparer<object>
         {
             public new bool Equals(object x, object y) => ReferenceEquals(x, y);
@@ -245,6 +270,14 @@ namespace SpaceEngineers.RTHWAccel
         private static readonly Dictionary<object, RenderableEntry> s_renderables =
             new Dictionary<object, RenderableEntry>(new ReferenceComparer());
         private static uint[] s_variantMaterials = new uint[64];
+        // Per skinned model instance (by reference), per LOD index; and this frame's last one resolved (instances of
+        // one block type and skin often come in a row).
+        private static readonly Dictionary<object, SkinnedLodEntry[]> s_skinnedModels =
+            new Dictionary<object, SkinnedLodEntry[]>(new ReferenceComparer());
+        private static object s_lastSkinned;
+        private static int s_lastSkinnedLod;
+        private static uint s_lastSkinnedMesh;
+        private static uint s_lastSkinnedHandle;
         private static readonly Dictionary<int, InstancingEntry> s_instancings = new Dictionary<int, InstancingEntry>();
         private static readonly HashSet<int> s_dirtyInstancings = new HashSet<int>();
         private static readonly Dictionary<string, uint> s_materials = new Dictionary<string, uint>(StringComparer.Ordinal);
@@ -287,6 +320,8 @@ namespace SpaceEngineers.RTHWAccel
         private static int s_variantsCreated;
         private static long s_overriddenInstances;
         private static long s_hiddenPartInstances;
+        private static long s_skinnedInstances;  // GeometryStage2 instances drawn with their own textures (skins)
+        private static int s_skinnedRebinds;     // skinned LODs resolved again: the game swapped a texture
         // Per old-pipeline LOD mesh, the parts ever seen hidden in the main view: registered non-opaque
         // (kPartHideable). Only grows, so that renderables hiding different parts of one mesh agree.
         private static readonly Dictionary<int, HashSet<int>> s_hideableParts = new Dictionary<int, HashSet<int>>();
@@ -368,6 +403,27 @@ namespace SpaceEngineers.RTHWAccel
                 set(nameof(InstanceState.KeyColor), Compiled.Member(i, "KeyColor")),
                 set(nameof(InstanceState.MetalnessColorable), Compiled.Member(i, "MetalnessColorable")),
             });
+            Type modelInstance = GameReflection.Type(render11, "VRage.Render11.GeometryStage2.Model.MyModelInstance");
+            Type lodInstance = GameReflection.Type(render11, "VRage.Render11.GeometryStage2.Model.MyLodInstance");
+            // o => { var own = ((MyInstance)o).ModelInstance; return own?.Changes?.Count > 0 ? own : null; }
+            ParameterExpression boxedOwner = Expression.Parameter(typeof(object), "o");
+            Expression ownValue = Compiled.Member(Expression.Convert(boxedOwner, instance), "ModelInstance");
+            ParameterExpression own = Expression.Variable(ownValue.Type, "own");
+            Expression changesValue = Compiled.Member(own, "Changes");
+            ParameterExpression changes = Expression.Variable(changesValue.Type, "changes");
+            s_skinnedModelInstance = Expression.Lambda<Func<object, object>>(Expression.Block(new[] { own, changes },
+                Expression.Assign(own, ownValue),
+                Expression.Condition(Expression.NotEqual(own, Expression.Constant(null, own.Type)),
+                    Expression.Block(
+                        Expression.Assign(changes, changesValue),
+                        Expression.Condition(Expression.AndAlso(
+                                Expression.NotEqual(changes, Expression.Constant(null, changes.Type)),
+                                Expression.GreaterThan(Expression.Property(changes, "Count"), Expression.Constant(0))),
+                            Expression.Convert(own, typeof(object)), Expression.Constant(null))),
+                    Expression.Constant(null))), boxedOwner).Compile();
+            s_modelInstanceLods = Compiled.Getter<object[]>(modelInstance, "LodInstances");
+            s_lodInstanceSrvs = LodInstanceBinding<object[]>(lodInstance, "Srvs");
+            s_lodInstanceAlphamask = LodInstanceBinding<object>(lodInstance, "SrvAlphamask");
             s_modelValid = Compiled.Getter<bool>(model, "IsValid");
             s_modelLods = Compiled.Getter<IList>(model, "m_lods");
             s_lodVb0 = Compiled.Getter<object>(lod, "VB0");
@@ -416,6 +472,7 @@ namespace SpaceEngineers.RTHWAccel
 
             s_pools = Compiled.StaticGetter<Dictionary<Type, MyRuntimeObjectsPool<MyActorComponent>>>(factory, "m_pools");
             LampMirror.Resolve(render11);
+            DecalMirror.Resolve(render11);
             s_readRenderable = Reader<RenderableReader>(s_renderableType, typeof(RenderableState), (c, set) =>
             {
                 Expression cull = Compiled.Member(c, "CullProxy");
@@ -518,8 +575,25 @@ namespace SpaceEngineers.RTHWAccel
             s_instancingStride = Indexed<int>(instancingInfos, "Stride", 0);
         }
 
+        // (lodInstance, i) => parts != null && 0 <= i < parts.Length ? (T)parts[i].member : null, parts being the
+        // model instance LOD's GBufferParts (MyRenderMaterialBindings).
+        private static Func<object, int, T> LodInstanceBinding<T>(Type lodInstance, string member) where T : class
+        {
+            ParameterExpression boxed = Expression.Parameter(typeof(object), "o");
+            ParameterExpression index = Expression.Parameter(typeof(int), "i");
+            Expression value = Compiled.Member(Expression.Convert(boxed, lodInstance), "GBufferParts");
+            ParameterExpression parts = Expression.Variable(value.Type, "parts");
+            return Expression.Lambda<Func<object, int, T>>(Expression.Block(new[] { parts },
+                Expression.Assign(parts, value),
+                Expression.Condition(Expression.AndAlso(Expression.NotEqual(parts, Expression.Constant(null, parts.Type)),
+                    Expression.AndAlso(Expression.GreaterThanOrEqual(index, Expression.Constant(0)),
+                        Expression.LessThan(index, Expression.ArrayLength(parts)))),
+                    Compiled.To<T>(Compiled.Member(Expression.ArrayIndex(parts, index), member)),
+                    Expression.Constant(null, typeof(T)))), boxed, index).Compile();
+        }
+
         // (object o, ref TState state) => { var x = (type)o; state.A = ...; state.B = ...; }
-        private static TDelegate Reader<TDelegate>(Type type, Type stateType,
+        internal static TDelegate Reader<TDelegate>(Type type, Type stateType,
             Func<Expression, Func<string, Expression, Expression>, Expression[]> assignments)
         {
             ParameterExpression input = Expression.Parameter(typeof(object), "o");
@@ -597,6 +671,7 @@ namespace SpaceEngineers.RTHWAccel
         {
             long start = Stopwatch.GetTimestamp();
             ++s_frame;
+            s_lastSkinned = null;
             s_instanceCount = 0;
             s_bucketCount = 0;
             s_overrideCount = 0;
@@ -634,6 +709,7 @@ namespace SpaceEngineers.RTHWAccel
                 s_overrideCount);
             NativeApi.RtSkinsSubmit(s_frameSkins, s_skinCount, s_bones, s_boneCount, s_palettes, s_paletteCount);
             LampMirror.Snapshot(pools);
+            DecalMirror.Snapshot();
             SendEnvironment();
 
             if (s_frame % EvictAfterFrames == 0)
@@ -666,10 +742,18 @@ namespace SpaceEngineers.RTHWAccel
             IList lods = s_modelLods(state.Model);
             if (lods == null || lods.Count == 0)
                 return;
-            object lod = lods[Math.Max(0, Math.Min(state.Lod, lods.Count - 1))];
+            int lodIndex = Math.Max(0, Math.Min(state.Lod, lods.Count - 1));
+            object lod = lods[lodIndex];
             uint mesh = ModelMesh(lod);
             if (mesh != 0)
             {
+                // A skin: the instance draws its own model instance's textures.
+                object own = s_skinnedModelInstance(instance);
+                if (own != null)
+                {
+                    mesh = SkinnedModelMesh(own, lodIndex, lod, mesh);
+                    ++s_skinnedInstances;
+                }
                 Vector4 key = state.KeyColor.ToVector4();
                 AddInstance(mesh, mask, actor.ID, in actor.WorldMatrix, new Vector3(key.X, key.Y, key.Z),
                     state.MetalnessColorable ? 1u : 0u, 0, ModelOverrides(instance, lod));
@@ -1056,17 +1140,19 @@ namespace SpaceEngineers.RTHWAccel
                 return 0;  // not loaded yet; asked again next frame
             SharpDX.Direct3D11.Buffer attributes = vb1 != null ? s_bufferNative(vb1) : null;
             int partCount = 0;
+            var materials = new List<uint>();
             IList parts = s_lodGbufferParts(lod);
             if (parts != null)
             {
                 foreach (object part in parts)
                 {
                     int technique = s_partTechnique(part);
-                    if (Unmirrored(technique))
+                    if (!ModelPart(part, technique))
                         continue;
-                    bool masked = technique == TechniqueAlphaMasked || technique == TechniqueAlphaMaskedSingleSided;
+                    uint material = Material(s_partTextures(part), Masked(technique) ? 1u : 0u);
                     AddPart(ref partCount, s_partIndexStart(part), s_partIndexCount(part), 0, technique,
-                        s_partDoubleSided(part), Material(s_partTextures(part), masked ? 1u : 0u));
+                        s_partDoubleSided(part), material);
+                    materials.Add(material);
                 }
             }
             var desc = new RtMeshDesc
@@ -1084,8 +1170,108 @@ namespace SpaceEngineers.RTHWAccel
                 Kind = 0,
             };
             entry = Register(ref desc, partCount, vb0);
+            entry.Materials = materials.ToArray();
             s_modelMeshes[lod] = entry;
             return entry.Handle;
+        }
+
+        // A GeometryStage2 LOD part the mesh is registered with (ModelMesh, AddPart).
+        private static bool ModelPart(object part, int technique) =>
+            !Unmirrored(technique) && s_partIndexCount(part) > 0 && s_partIndexStart(part) >= 0;
+
+        // The mesh a skinned GeometryStage2 instance draws: its LOD's mesh with the model instance's bindings
+        // (MyLodInstance.GBufferParts, by the LOD's part index) as the parts' materials, a variant where they differ
+        // from the model's own; resolved once per model instance, LOD and mesh.
+        private static uint SkinnedModelMesh(object modelInstance, int lodIndex, object lod, uint mesh)
+        {
+            if (ReferenceEquals(modelInstance, s_lastSkinned) && lodIndex == s_lastSkinnedLod && mesh == s_lastSkinnedMesh)
+                return s_lastSkinnedHandle;
+            if (!s_skinnedModels.TryGetValue(modelInstance, out SkinnedLodEntry[] lods) || lodIndex >= lods.Length)
+            {
+                Array.Resize(ref lods, Math.Max(lodIndex + 1, lods?.Length ?? 0));
+                s_skinnedModels[modelInstance] = lods;
+            }
+            SkinnedLodEntry cached = lods[lodIndex];
+            if (cached == null || cached.Mesh != mesh || (cached.LastSeen != s_frame && !StillBound(modelInstance, lodIndex, cached)))
+            {
+                if (cached != null && cached.Mesh == mesh)
+                    ++s_skinnedRebinds;
+                cached = ResolveSkinnedMesh(modelInstance, lodIndex, lod, mesh);
+                lods[lodIndex] = cached;
+            }
+            cached.LastSeen = s_frame;
+            s_lastSkinned = modelInstance;
+            s_lastSkinnedLod = lodIndex;
+            s_lastSkinnedMesh = mesh;
+            s_lastSkinnedHandle = cached.Handle;
+            return cached.Handle;
+        }
+
+        private static SkinnedLodEntry ResolveSkinnedMesh(object modelInstance, int lodIndex, object lod, uint mesh)
+        {
+            var resolved = new SkinnedLodEntry { Mesh = mesh, Handle = mesh };
+            object own = LodInstance(modelInstance, lodIndex);
+            IList parts = s_lodGbufferParts(lod);
+            if (own == null || parts == null || !s_modelMeshes.TryGetValue(lod, out MeshEntry entry) || entry.Handle != mesh ||
+                entry.Materials == null)
+                return resolved;
+            var indices = new List<int>();
+            var bound = new List<object>();
+            int count = 0;
+            for (int i = 0; i < parts.Count; i++)
+            {
+                object part = parts[i];
+                int technique = s_partTechnique(part);
+                if (!ModelPart(part, technique))
+                    continue;
+                object[] textures = BoundTextures(own, i);
+                indices.Add(i);
+                bound.AddRange(textures);
+                if (count == s_variantMaterials.Length)
+                    Array.Resize(ref s_variantMaterials, count * 2);
+                s_variantMaterials[count++] = Material(textures, Masked(technique) ? 1u : 0u);
+            }
+            resolved.Handle = VariantOf(entry, mesh, count);
+            resolved.Parts = indices.ToArray();
+            resolved.Bound = bound.ToArray();
+            return resolved;
+        }
+
+        private static object LodInstance(object modelInstance, int lodIndex)
+        {
+            object[] lodInstances = s_modelInstanceLods(modelInstance);
+            return lodInstances != null && lodIndex < lodInstances.Length ? lodInstances[lodIndex] : null;
+        }
+
+        // The four textures a model instance's LOD part draws with now (in s_boundTextures): ColorMetal, NormalGloss,
+        // Extensions and the alpha mask (SrvAlphamask, which the game keeps current as textures stream; else Srvs[3]).
+        private static object[] BoundTextures(object lodInstance, int part)
+        {
+            object[] srvs = s_lodInstanceSrvs(lodInstance, part);
+            for (int slot = 0; slot < 3; slot++)
+                s_boundTextures[slot] = srvs != null && slot < srvs.Length ? srvs[slot] : null;
+            s_boundTextures[3] = s_lodInstanceAlphamask(lodInstance, part) ?? (srvs != null && srvs.Length > 3 ? srvs[3] : null);
+            return s_boundTextures;
+        }
+
+        // Whether a skinned LOD still draws the textures it was resolved with.
+        private static bool StillBound(object modelInstance, int lodIndex, SkinnedLodEntry cached)
+        {
+            if (cached.Parts == null)
+                return true;
+            object own = LodInstance(modelInstance, lodIndex);
+            if (own == null)
+                return true;
+            for (int k = 0; k < cached.Parts.Length; k++)
+            {
+                object[] textures = BoundTextures(own, cached.Parts[k]);
+                for (int slot = 0; slot < 4; slot++)
+                {
+                    if (!ReferenceEquals(textures[slot], cached.Bound[k * 4 + slot]))
+                        return false;
+                }
+            }
+            return true;
         }
 
         // An old-pipeline or voxel LOD mesh's handle, registered on first use.
@@ -1174,15 +1360,28 @@ namespace SpaceEngineers.RTHWAccel
             return entry.Handle;
         }
 
-        // Parts drawn with these techniques stay out of the mirror: the decals lie on other surfaces, and the
-        // transparent pass's parts (holograms, glass, atmospheres, cloud layers, shields) are not in the game's
-        // G-buffer, so the rays pass them as the game's own lighting does. (An old-pipeline cockpit's canopy is a
-        // GLASS part of its block's model: mirrored, it stopped the camera's rays and the bounces on everything
-        // seen through it, which then stayed dark.)
+        // Parts drawn with these techniques stay out of the mirror: the transparent pass's parts (holograms, glass,
+        // atmospheres, cloud layers, shields) are not in the game's G-buffer, so the rays pass them as the game's
+        // own lighting does. (An old-pipeline cockpit's canopy is a GLASS part of its block's model: mirrored, it
+        // stopped the camera's rays and the bounces on everything seen through it, which then stayed dark.) Decals
+        // are mirrored: cutout ones as alpha-tested parts (Masked), blended ones as layers the rays look through
+        // and blend into the surface beneath (DecalFlags; scene_common.hlsli TraceClosestDecals).
         private static bool Unmirrored(int technique) =>
-            (technique >= TechniqueDecal && technique <= TechniqueDecalCutout) ||
-            (!s_mirrorTransparent && (technique == TechniqueHolo || technique == TechniqueGlass ||
-                                      (technique >= TechniqueAtmosphere && technique <= TechniqueShieldLit)));
+            !s_mirrorTransparent && (technique == TechniqueHolo || technique == TechniqueGlass ||
+                                     (technique >= TechniqueAtmosphere && technique <= TechniqueShieldLit));
+
+        // Alpha-tested parts (non-opaque, solid where their alpha mask reaches 0.5): the game's alpha-masked
+        // techniques and its cutout decals (STATIC_DECAL_CUTOUT: clipped at 0.5, then written over the surface).
+        private static bool Masked(int technique) =>
+            technique == TechniqueAlphaMasked || technique == TechniqueAlphaMaskedSingleSided ||
+            technique == TechniqueDecalCutout;
+
+        // Decal flags (scene.h): the blended decals (STATIC_DECAL: blended into the surface's G-buffer by their alpha
+        // mask, premultiplied or not) kPartDecal (8), with kPartDecalPremultiplied (16) for the premultiplied ones;
+        // the cutout ones (alpha-tested, Masked) kPartDecalCutout (32), which only the camera's rays see.
+        private static uint DecalFlags(int technique) =>
+            technique == TechniqueDecal ? 8u | 16u : technique == TechniqueDecalNoPremult ? 8u :
+            technique == TechniqueDecalCutout ? 32u : 0u;
         private static bool s_mirrorTransparent;
 
         // A proxy part an old-pipeline mesh is registered with.
@@ -1191,8 +1390,7 @@ namespace SpaceEngineers.RTHWAccel
 
         private static uint PartMaterialFlags(in ProxyState proxy)
         {
-            bool masked = proxy.Technique == TechniqueAlphaMasked || proxy.Technique == TechniqueAlphaMaskedSingleSided;
-            return (masked ? 1u : 0u) | ((proxy.Flags & MetalnessColorableFlag) != 0 ? 2u : 0u);
+            return (Masked(proxy.Technique) ? 1u : 0u) | ((proxy.Flags & MetalnessColorableFlag) != 0 ? 2u : 0u);
         }
 
         // The handle for a renderable's own materials: its LOD mesh is shared by
@@ -1250,6 +1448,13 @@ namespace SpaceEngineers.RTHWAccel
                     Array.Resize(ref s_variantMaterials, count * 2);
                 s_variantMaterials[count++] = Material(s_proxyTextures(proxy.MaterialProxy), PartMaterialFlags(in proxy));
             }
+            return VariantOf(entry, mesh, count);
+        }
+
+        // The mesh itself when the first `count` materials of s_variantMaterials are those it was registered with,
+        // else its variant with them (created on first use).
+        private static uint VariantOf(MeshEntry entry, uint mesh, int count)
+        {
             if (count != entry.Materials.Length)
                 return mesh;  // other parts than registered: the mesh as it is
             bool same = true;
@@ -1272,7 +1477,7 @@ namespace SpaceEngineers.RTHWAccel
         // Alphamask): files are read by the native core, textures the game generates (screens' render
         // targets, its default textures) are mirrored from the game's device; anything else keeps the
         // native default for the slot.
-        private static uint Material(object[] textures, uint flags)
+        internal static uint Material(object[] textures, uint flags)
         {
             for (int slot = 0; slot < 4; slot++)
             {
@@ -1306,13 +1511,13 @@ namespace SpaceEngineers.RTHWAccel
                 return;
             if (count == s_parts.Length)
                 Array.Resize(ref s_parts, s_parts.Length * 2);
-            bool masked = technique == TechniqueAlphaMasked || technique == TechniqueAlphaMaskedSingleSided;
             s_parts[count++] = new RtMeshPart
             {
                 IndexStart = (uint)indexStart,
                 IndexCount = (uint)indexCount,
                 BaseVertex = baseVertex,
-                Flags = (masked ? 1u : 0u) | (doubleSided ? 2u : 0u) | (hideable ? 4u : 0u),
+                Flags = (Masked(technique) ? 1u : 0u) | (doubleSided ? 2u : 0u) | (hideable ? 4u : 0u) |
+                        DecalFlags(technique),
                 Material = material,
             };
         }
@@ -1448,6 +1653,20 @@ namespace SpaceEngineers.RTHWAccel
                     NativeApi.RtInstancingRelease(s_instancings[key].Handle);
                 s_instancings.Remove(key);
             }
+            // Skinned model instances no instance drew for a while (their variants belong to the meshes' entries).
+            foreach (object key in s_skinnedModels.Keys.ToList())
+            {
+                SkinnedLodEntry[] lods = s_skinnedModels[key];
+                bool any = false;
+                for (int i = 0; i < lods.Length; i++)
+                {
+                    if (lods[i] != null && lods[i].LastSeen < threshold)
+                        lods[i] = null;
+                    any |= lods[i] != null;
+                }
+                if (!any)
+                    s_skinnedModels.Remove(key);
+            }
         }
 
         private static void Report()
@@ -1463,12 +1682,16 @@ namespace SpaceEngineers.RTHWAccel
                      $"{s_skippedSkinned} left out this window), " +
                      $"{s_overriddenInstances / frames:F0} instances with their own part colors or emissivity per frame " +
                      $"({s_hiddenPartInstances / frames:F0} with parts hidden in the main view; {s_reregistered} meshes " +
-                     "registered anew for them).");
+                     $"registered anew for them), {s_skinnedInstances / frames:F0} model instances with a skin's textures " +
+                     $"per frame ({s_skinnedModels.Count} skinned model instances known, {s_skinnedRebinds} LODs bound anew as textures " +
+                     "streamed).");
             s_ticks = s_maxTicks = s_instanceSum = s_bucketSum = s_blockSum = s_overriddenInstances = 0;
-            s_hiddenPartInstances = s_reregistered = s_skinSum = s_skinBoneSum = 0;
+            s_hiddenPartInstances = s_reregistered = s_skinSum = s_skinBoneSum = s_skinnedInstances = 0;
+            s_skinnedRebinds = 0;
             s_registered = s_refused = s_released = s_recordUploads = s_skippedSkinned = s_materialsCreated = 0;
             s_variantsCreated = 0;
             LampMirror.Report(frames);
+            DecalMirror.Report(frames);
         }
     }
 }

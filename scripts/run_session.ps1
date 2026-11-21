@@ -34,12 +34,17 @@ param(
     [string]$DebugView = '',
     [ValidateSet('', 'auto', 'rr', 'filter')][string]$Denoiser = '',
     [ValidateSet('', 'on', 'off')][string]$CharacterLights = '',
+    [ValidateSet('', 'on', 'off')][string]$DecalLights = '',
     [string]$LampIntensity = '',
     [string]$EmissiveIntensity = '',
     # [Debug] InspectorSequence: every gate mode in turn, screenshots, timings.
     [switch]$Inspector,
     # [Debug] FreeCamera: the game's spectator camera (F8) in this world even if it does not allow it.
     [switch]$FreeCamera,
+    # [Debug] TestDecals: bullet holes where the player's view meets a grid, then views of them.
+    [switch]$Decals,
+    # [Debug] LookAtSkins: views of the nearest block with each armor skin listed (comma-separated subtypes).
+    [string]$Skins = '',
     # Also install the HighFPSFix release build (the sister repository's
     # plugin-only package) for this run, with these settings of its INI:
     # [FrameRate] TargetFPS (0: the display's refresh rate, -1: no cap),
@@ -162,11 +167,16 @@ $ini = Set-IniValue $ini 'Debug' 'TracePath' $(if ($NoTrace) { '' } else { Join-
 $ini = Set-IniValue $ini 'Debug' 'CapturePath' (Join-Path $runDir 'captures')
 if ($Inspector) { $ini = Set-IniValue $ini 'Debug' 'InspectorSequence' 'true' }
 if ($FreeCamera) { $ini = Set-IniValue $ini 'Debug' 'FreeCamera' 'true' }
+if ($Decals) { $ini = Set-IniValue $ini 'Debug' 'TestDecals' 'true' }
+if ($Skins) { $ini = Set-IniValue $ini 'Debug' 'LookAtSkins' $Skins }
 if ($GateMode) { $ini = Set-IniValue $ini 'RayTracing' 'GateMode' $GateMode }
 if ($DebugView) { $ini = Set-IniValue $ini 'RayTracing' 'DebugView' $DebugView }
 if ($Denoiser) { $ini = Set-IniValue $ini 'RayTracing' 'Denoiser' $Denoiser }
 if ($CharacterLights) {
     $ini = Set-IniValue $ini 'RayTracing' 'CharacterLights' $(if ($CharacterLights -eq 'on') { 'true' } else { 'false' })
+}
+if ($DecalLights) {
+    $ini = Set-IniValue $ini 'RayTracing' 'DecalLights' $(if ($DecalLights -eq 'on') { 'true' } else { 'false' })
 }
 foreach ($key in 'LampIntensity', 'EmissiveIntensity') {
     $text = Get-Variable -Name $key -ValueOnly

@@ -49,6 +49,10 @@ namespace SpaceEngineers.RTHWAccel
                     }
                     if (settings.InspectorSequence)
                         InspectorSequence(settings);
+                    if (settings.TestDecals)
+                        DecalSequence(settings);
+                    if (!string.IsNullOrWhiteSpace(settings.LookAtSkins))
+                        SkinSequence(settings);
                 }
                 if (settings.AutoQuitSeconds > 0)
                 {
@@ -102,6 +106,17 @@ namespace SpaceEngineers.RTHWAccel
             // test against the game's G-buffer); Ray Reconstruction (as the setting resolves), then our filter.
             Step(GateMode.Replace, DebugView.Lit, 12, "lit-replace");
             Step(GateMode.Replace, DebugView.LitFilter, 12, "lit-filter-replace");
+            // The glowing decals' light, A/B in the same view within the session (the machine's own drift from run
+            // to run is as large as its cost): windows with it off and on in turn (the log's "gate mode is now"
+            // lines say "glowing decals only glow" for the former), then as the settings have it.
+            for (int round = 0; round < 3; ++round)
+            {
+                NativeApi.RtSetDecalLights(false);
+                Step(GateMode.Replace, DebugView.Lit, 7, round == 0 ? "lit-replace-decal-glow-only" : null);
+                NativeApi.RtSetDecalLights(true);
+                Step(GateMode.Replace, DebugView.Lit, 7, round == 0 ? "lit-replace-decal-lights" : null);
+            }
+            NativeApi.RtSetDecalLights(settings.DecalLights);
             // Emissive surfaces as lights alone (replace: without the game's local lights on top), then the same
             // without reusing light samples: the unbiased reference the reuse must match on average (the log's
             // sampled diffuse light, and the accumulated images).
@@ -164,6 +179,240 @@ namespace SpaceEngineers.RTHWAccel
                     Capture(settings, capture);
                 Thread.Sleep(TimeSpan.FromSeconds(2));
             }
+        }
+
+        // [Debug] TestDecals: bullet holes where the player's view meets a grid (the game's own projected decals:
+        // MyDecals.HandleAddDecal at the hits of rays from the camera, as a rifle's bullets leave them, in pairs that
+        // overlap), then the game's frame with them, the traced base color, its comparison with the G-buffer (which
+        // the game's decal pass blends them into: the log's "projected decals" line of each window) and the traced
+        // light. Run without the inspector: its views stay as they are.
+        private static void DecalSequence(Settings settings)
+        {
+            int placed = 0;
+            bool done = false;
+            MySandboxGame.Static.Invoke(() =>
+            {
+                try
+                {
+                    placed = PlaceBulletHoles();
+                }
+                catch (Exception exception)
+                {
+                    Log.Error("Decal test: placing the bullet holes failed", exception);
+                }
+                finally
+                {
+                    done = true;
+                }
+            }, Plugin.Name);
+            Plugin.WaitUntil(() => done, TimeSpan.FromSeconds(10));
+            Log.Info($"Decal test: {placed} bullet holes placed; their textures load.");
+            Thread.Sleep(TimeSpan.FromSeconds(4));
+            Step(GateMode.Off, null, 6, "decals-game");
+            Step(GateMode.Replace, DebugView.BaseColor, 6, "decals-basecolor");
+            Step(GateMode.Replace, DebugView.MaterialCompare, 8, "decals-materialcompare");
+            Step(GateMode.Replace, DebugView.Lit, 12, "decals-lit-replace");
+            Step(GateMode.Off, null, 6, "decals-game-after");
+            NativeApi.RtSetDebugView(settings.DebugView);
+            NativeApi.RtSetGateMode(settings.GateMode);
+            Thread.Sleep(1000);
+            Log.Info("Decal test: done.");
+
+            void Step(GateMode mode, DebugView? view, int seconds, string capture)
+            {
+                Log.Info($"Decal test: gate mode {mode}{(view != null ? ", debug view " + view : "")} for {seconds} s.");
+                if (view != null)
+                    NativeApi.RtSetDebugView(view.Value);
+                NativeApi.RtSetGateMode(mode);
+                Thread.Sleep(TimeSpan.FromSeconds(seconds - 2));
+                Capture(settings, capture);
+                Thread.Sleep(TimeSpan.FromSeconds(2));
+            }
+        }
+
+        // Update thread: rays from the camera over the middle of its view (11 x 7 directions, 0.06 apart), up to
+        // 12 m; at each grid they hit, a rifle bullet's hole and a second one 6 cm beside it. The bullet holes placed.
+        private static int PlaceBulletHoles()
+        {
+            VRage.Game.Utils.MyCamera camera = MySector.MainCamera;
+            VRage.Game.ModAPI.IMyPhysics physics = Sandbox.ModAPI.MyAPIGateway.Physics;
+            if (camera == null || physics == null)
+                return 0;
+            MatrixD view = camera.WorldMatrix;
+            Vector3D eye = view.Translation;
+            VRage.Utils.MyStringHash rifle = VRage.Utils.MyStringHash.GetOrCompute("RifleBullet");
+            VRage.Utils.MyStringHash metal = VRage.Utils.MyStringHash.GetOrCompute("Metal");
+            int placed = 0;
+            int hitGrids = 0;
+            double nearest = double.MaxValue;
+            double farthest = 0;
+            for (int y = -3; y <= 3; ++y)
+            {
+                for (int x = -5; x <= 5; ++x)
+                {
+                    Vector3D direction = Vector3D.Normalize(view.Forward + view.Right * (x * 0.06) + view.Up * (y * 0.06));
+                    if (!physics.CastRay(eye, eye + direction * 12, out VRage.Game.ModAPI.IHitInfo hit) ||
+                        !(hit?.HitEntity is VRage.ModAPI.IMyEntity entity) ||
+                        !(entity.GetTopMostParent() is MyCubeGrid))
+                        continue;
+                    ++hitGrids;
+                    double distance = Vector3D.Distance(eye, hit.Position);
+                    nearest = Math.Min(nearest, distance);
+                    farthest = Math.Max(farthest, distance);
+                    Vector3 normal = hit.Normal;
+                    Vector3 side = Vector3.Normalize(Vector3.Cross(normal, (Vector3)view.Up));
+                    if (!side.IsValid() || side.LengthSquared() < 0.5f)
+                        side = Vector3.Normalize(Vector3.Cross(normal, (Vector3)view.Right));
+                    for (int pair = 0; pair < 2; ++pair)
+                    {
+                        var info = new VRage.Game.ModAPI.MyHitInfo
+                        {
+                            Position = hit.Position + side * (pair * 0.06f),
+                            Normal = normal,
+                        };
+                        Sandbox.Game.MyDecals.HandleAddDecal(entity, info, (Vector3)direction, physicalMaterial: metal,
+                            source: rifle);
+                        ++placed;
+                    }
+                }
+            }
+            Log.Info($"Decal test: rays from the camera met grids {hitGrids} times, " +
+                     (hitGrids != 0 ? $"{nearest:F1} to {farthest:F1} m away." : "none within 12 m."));
+            return placed;
+        }
+
+        // [Debug] LookAtSkins (armor skin subtypes, comma-separated; "block:<subtype>" for a block type): per entry, the
+        // spectator 3 m from the matching block nearest to the camera (on the camera's side), then the game's frame,
+        // the comparison of the traced material with the G-buffer (the log's "traced material" line of the window) and
+        // the traced light, with screenshots.
+        private static void SkinSequence(Settings settings)
+        {
+            foreach (string entry in settings.LookAtSkins.Split(','))
+            {
+                string skin = entry.Trim();
+                if (skin.Length == 0)
+                    continue;
+                bool found = false;
+                bool done = false;
+                MySandboxGame.Static.Invoke(() =>
+                {
+                    try
+                    {
+                        found = LookAtSkin(skin);
+                    }
+                    catch (Exception exception)
+                    {
+                        Log.Error("Skin test: placing the camera failed", exception);
+                    }
+                    finally
+                    {
+                        done = true;
+                    }
+                }, Plugin.Name);
+                Plugin.WaitUntil(() => done, TimeSpan.FromSeconds(10));
+                if (!found)
+                    continue;
+                Thread.Sleep(TimeSpan.FromSeconds(3));  // textures stream in
+                string label = skin.Replace(':', '-');  // file names
+                // A block type is looked at from above: probes at the middle of the view say what the rays hit there.
+                bool byBlock = skin.StartsWith("block:", StringComparison.OrdinalIgnoreCase);
+                if (byBlock)
+                    NativeApi.RtSetProbes(new[] { 960, 540, 960, 600, 900, 540, 1020, 540, 960, 480 });
+                Step(GateMode.Off, null, 5, $"skin-{label}-game");
+                Step(GateMode.Replace, DebugView.BaseColor, 5, $"skin-{label}-basecolor");
+                Step(GateMode.Replace, DebugView.MaterialCompare, 6, $"skin-{label}-materialcompare");
+                Step(GateMode.Replace, DebugView.Lit, 8, $"skin-{label}-lit-replace");
+                if (byBlock)
+                {
+                    // The light's parts apart: the sun and occlusion alone (clay), the traced light before any
+                    // denoiser, the emitters' light alone.
+                    Step(GateMode.Replace, DebugView.Clay, 5, $"skin-{label}-clay");
+                    Step(GateMode.Overlay, DebugView.LitRaw, 8, $"skin-{label}-lit-raw");
+                    Step(GateMode.Replace, DebugView.Emitters, 8, $"skin-{label}-emitters");
+                    NativeApi.RtSetProbes(settings.Probes);
+                }
+            }
+            NativeApi.RtSetDebugView(settings.DebugView);
+            NativeApi.RtSetGateMode(settings.GateMode);
+            Thread.Sleep(1000);
+            Log.Info("Skin test: done.");
+
+            void Step(GateMode mode, DebugView? view, int seconds, string capture)
+            {
+                Log.Info($"Skin test: gate mode {mode}{(view != null ? ", debug view " + view : "")} for {seconds} s.");
+                if (view != null)
+                    NativeApi.RtSetDebugView(view.Value);
+                NativeApi.RtSetGateMode(mode);
+                Thread.Sleep(TimeSpan.FromSeconds(seconds - 2));
+                Capture(settings, capture);
+                Thread.Sleep(TimeSpan.FromSeconds(2));
+            }
+        }
+
+        // Update thread: the spectator 3 m from the centre of the block with `skin` nearest to the camera, on the
+        // camera's side, looking at it. Whether one was found.
+        private static bool LookAtSkin(string skin)
+        {
+            MySession session = MySession.Static;
+            VRage.Game.Utils.MyCamera camera = MySector.MainCamera;
+            if (session == null || camera == null)
+                return false;
+            // "block:<subtype>": a block type instead of a skin.
+            bool byBlock = skin.StartsWith("block:", StringComparison.OrdinalIgnoreCase);
+            string blockSubtype = byBlock ? skin.Substring(6) : null;
+            VRage.Utils.MyStringHash wanted = VRage.Utils.MyStringHash.GetOrCompute(skin);
+            Vector3D eye = camera.Position;
+            Sandbox.Game.Entities.Cube.MySlimBlock best = null;
+            MyCubeGrid bestGrid = null;
+            Vector3D bestCenter = Vector3D.Zero;
+            double bestDistance = double.MaxValue;
+            int count = 0;
+            foreach (var entity in MyEntities.GetEntities())
+            {
+                if (!(entity is MyCubeGrid grid))
+                    continue;
+                foreach (Sandbox.Game.Entities.Cube.MySlimBlock block in grid.GetBlocks())
+                {
+                    if (byBlock ? block.BlockDefinition.Id.SubtypeName != blockSubtype : block.SkinSubtypeId != wanted)
+                        continue;
+                    ++count;
+                    block.ComputeWorldCenter(out Vector3D center);
+                    double distance = Vector3D.DistanceSquared(center, eye);
+                    if (distance < bestDistance)
+                    {
+                        best = block;
+                        bestGrid = grid;
+                        bestCenter = center;
+                        bestDistance = distance;
+                    }
+                }
+            }
+            if (best == null)
+            {
+                Log.Info($"Skin test: no block with the {skin} skin.");
+                return false;
+            }
+            Vector3D toEye = eye - bestCenter;
+            Vector3D direction = toEye.LengthSquared() > 1e-6 ? Vector3D.Normalize(toEye) : bestGrid.WorldMatrix.Up;
+            Vector3D up = bestGrid.WorldMatrix.Up;
+            if (byBlock)
+            {
+                // From above, by the grid's up (the floor a block is set in), a little toward the grid's front.
+                MatrixD gridWorld = bestGrid.WorldMatrix;
+                direction = Vector3D.Normalize(gridWorld.Up + gridWorld.Forward * 0.4);
+                up = gridWorld.Forward;
+            }
+            Vector3D position = bestCenter + direction * 3;
+            session.SetCameraController(MyCameraControllerEnum.Spectator, null, position);
+            MySpectatorCameraController spectator = MySpectatorCameraController.Static;
+            if (spectator != null)
+            {
+                spectator.Position = position;
+                spectator.SetTarget(bestCenter, up);
+            }
+            Log.Info($"Skin test: {count} blocks with the {skin} skin; looking at a {best.BlockDefinition.Id.SubtypeName} " +
+                     $"of {bestGrid.DisplayName}, {Math.Sqrt(bestDistance):F1} m from the camera.");
+            return true;
         }
 
         private static volatile bool s_orbit;
