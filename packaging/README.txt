@@ -9,8 +9,10 @@ ray-tracing hardware:
 - Sunlight with soft shadows, and light from the sky
 - The game's lamps within 32 m of the camera, with shadows (beyond that,
   the game's own lamp light)
-- Light cast by glowing surfaces: screens, keypads, light strips, and the
-  glowing parts of character suits
+- Light cast by glowing surfaces: screens, keypads, light strips, glowing
+  decals such as indicator lights and signs, and the glowing parts of
+  character suits
+- Bullet holes and the other decals the game projects onto blocks
 - One bounce of indirect light, diffuse and glossy
 - Denoised by NVIDIA DLSS Ray Reconstruction on GeForce RTX GPUs, and by
   the plugin's own filter on other GPUs
@@ -20,7 +22,10 @@ glass and other transparent surfaces, particles, post-processing and the
 HUD. Only what you see changes: the simulation, the game's files and your
 saves are untouched.
 
-Version 0.1.0 is the first release.
+Version 0.2.0 adds bullet holes and the other projected decals, makes
+glowing decals light their surroundings, fixes armor skins on panels,
+interior walls and functional blocks, and lights cavities seen through an
+opening (such as the Collector's funnel), which were black.
 
 Requirements
 ------------
@@ -57,6 +62,8 @@ the next time the game starts. The main ones, under [RayTracing]:
   a brighter look.
 - Denoiser chooses between DLSS Ray Reconstruction and the plugin's own
   filter.
+- DecalLights = false makes glowing decals only glow, as in the game,
+  without lighting their surroundings.
 Set Enabled = false under [General] to switch the plugin off without
 removing it.
 
@@ -72,8 +79,9 @@ install it once.
 
 Not covered
 -----------
-- Grass, decals and glass are not ray traced: they keep the game's look.
-  Light passes through glass.
+- Grass and glass are not ray traced: they keep the game's look. Light
+  passes through glass.
+- Decals do not show in reflections.
 - Textures of the traced scene stream in during the first minute after a
   world loads.
 - The plugin's own filter (GPUs without Ray Reconstruction, or
