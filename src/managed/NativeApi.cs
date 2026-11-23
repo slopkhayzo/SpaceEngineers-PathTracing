@@ -18,8 +18,8 @@ namespace SpaceEngineers.RTHWAccel
     // does not count those fields as blittable and may reorder them.
     internal static unsafe class NativeApi
     {
-        public const uint ExpectedVersion = 15;
-        public const uint ExpectedSize = 232;
+        public const uint ExpectedVersion = 16;
+        public const uint ExpectedSize = 240;
 
         // sert::RtOptions.
         [StructLayout(LayoutKind.Sequential)]
@@ -35,6 +35,7 @@ namespace SpaceEngineers.RTHWAccel
             public float LampIntensity;      // the lamps' light (traced, and the game's beyond the traced area)
             public float EmissiveIntensity;  // the light emissive surfaces cast (not their own glow)
             public int DecalLights;          // 1: glowing decals are lights
+            public int LightTree;            // 1: lamps and emitters traced at any distance (the light tree)
         }
 
         private static delegate* unmanaged[Cdecl]<IntPtr, IntPtr, IntPtr*, int> s_createHook;
@@ -65,6 +66,7 @@ namespace SpaceEngineers.RTHWAccel
         private static delegate* unmanaged[Cdecl]<RtSkin*, uint, float*, uint, uint*, uint, void> s_rtSkinsSubmit;
         private static delegate* unmanaged[Cdecl]<RtDecal*, uint, void> s_rtDecalsSubmit;
         private static delegate* unmanaged[Cdecl]<int, void> s_rtSetDecalLights;
+        private static delegate* unmanaged[Cdecl]<int, void> s_rtSetLightTree;
 
         public static bool IsBound => s_log != null;
 
@@ -121,6 +123,7 @@ namespace SpaceEngineers.RTHWAccel
             s_rtSkinsSubmit = (delegate* unmanaged[Cdecl]<RtSkin*, uint, float*, uint, uint*, uint, void>)*(IntPtr*)(bytes + 208);
             s_rtDecalsSubmit = (delegate* unmanaged[Cdecl]<RtDecal*, uint, void>)*(IntPtr*)(bytes + 216);
             s_rtSetDecalLights = (delegate* unmanaged[Cdecl]<int, void>)*(IntPtr*)(bytes + 224);
+            s_rtSetLightTree = (delegate* unmanaged[Cdecl]<int, void>)*(IntPtr*)(bytes + 232);
             return null;
         }
 
@@ -150,7 +153,7 @@ namespace SpaceEngineers.RTHWAccel
         // Returns 0, or the number of the RT core's step that failed (logged natively).
         public static int RtInitialize(IntPtr d3d11Device, GateMode gateMode, DebugView debugView, float patternStrength,
             string tracePath, Denoiser denoiser, bool characterLights, float lampIntensity, float emissiveIntensity,
-            bool decalLights)
+            bool decalLights, bool lightTree)
         {
             fixed (char* path = tracePath ?? "")
             {
@@ -166,6 +169,7 @@ namespace SpaceEngineers.RTHWAccel
                     LampIntensity = lampIntensity,
                     EmissiveIntensity = emissiveIntensity,
                     DecalLights = decalLights ? 1 : 0,
+                    LightTree = lightTree ? 1 : 0,
                 };
                 CurrentGateMode = gateMode;
                 return s_rtInitialize(d3d11Device, &options);
@@ -331,6 +335,11 @@ namespace SpaceEngineers.RTHWAccel
 
         // Whether glowing decals light their surroundings, from the next frame on (a fresh statistics window).
         public static void RtSetDecalLights(bool on) => s_rtSetDecalLights(on ? 1 : 0);
+
+        // Whether the lit views trace lamps and emitters at any distance (the light grid's coarse levels, filled
+        // from the light tree) or 32 m around the camera, from the next frame on (the LightTree setting; the
+        // inspector's A/B); starts a fresh statistics window.
+        public static void RtSetLightTree(bool on) => s_rtSetLightTree(on ? 1 : 0);
 
         // The projected decals of the next frame, in the game's draw order (copied by the native side).
         public static void RtDecalsSubmit(RtDecal[] decals, int count)

@@ -81,6 +81,8 @@
 
 #include "scene_common.hlsli"
 #include "lights.hlsli"
+RWByteAddressBuffer LightTree : register(u27);  // the light tree (emissive_lights.hlsl builds it), read here
+#include "light_tree.hlsli"
 
 // An entry of the game's voxel material table (scene.cpp VoxelMaterialRecord;
 // TriplanarMaterialConstants' StandardTiling and color_far3).
@@ -109,7 +111,7 @@ RWTexture2D<float4> AlbedoEmission : register(u4);  // lit pixels: rgb the albed
 // the first mip's faces +X, -X, +Y, -Y, +Z, -Z side by side (env_atlas.hlsl).
 Texture2D<float4> EnvironmentFar : register(t9);
 Texture2D<float4> EnvironmentClose : register(t10);
-// 112 uint counters (offset = 4 * index, see the Count calls below; some of
+// 128 uint counters (offset = 4 * index, see the Count calls below; some of
 // them the light list's, emissive_lights.hlsl), then the probe records
 // (kProbeOffset).
 RWByteAddressBuffer Stats : register(u1);
@@ -149,8 +151,11 @@ StructuredBuffer<ProjectedDecal> ProjectedDecals : register(t18);
 
 static const uint kNoProbe = 0xFFFFFFFF;
 static const uint kMaxProbes = 8;
-static const uint kProbeOffset = 448;  // bytes: after the 112 counters (rt_core.cpp kProbeOffset)
-static const uint kProbeBytes = 96;    // 24 uints per probe (rt_core.cpp decodes them)
+static const uint kProbeOffset = 512;  // bytes: after the 128 counters (rt_core.cpp kProbeOffset)
+// 48 uints per probe (rt_core.cpp decodes them): what the ray hit (24), then the triangles it crosses
+// (RecordProbeCandidates).
+static const uint kProbeBytes = 192;
+static const uint kProbeCandidates = 6;
 
 // compute_screen_ray (Frame.hlsli): view-space direction with z = -1.
 float3 ScreenRay(float2 uv)
@@ -689,12 +694,12 @@ static const float kDecalReach = 0.03;
 // a. Its normal and AO mix by alphaN: the mask, or how far the decal's normal map turns from its own surface
 // (ComputeNormalMapAlphaBestEffort); without an extensions map its AO is that turn's
 // (ComputeAmbientOcclusionBestEffort). Whether it lies on the hit surface: within kDecalReach of its plane and not
-// behind it.
+// behind it by more than the game's decal depth bias lets it (DecalDepthBias, scene_common.hlsli TraceClosestDecals).
 // The decal is a part of the hit's instance: its transform (`toWorld`) and instance data are the hit's.
 bool ApplyDecal(inout MaterialSample m, DecalHits h, uint hitInstance, float3x3 toWorld, float4 instance,
                 float4 extra, float3 direction, float hitT, float3 hitNormal, float coneSpread)
 {
-    if (h.count == 0 || h.instanceIndex != hitInstance || h.t > hitT * 1.0001 + 0.001 ||
+    if (h.count == 0 || h.instanceIndex != hitInstance || h.t > hitT * (1.0001 + DecalDepthBias) + 0.001 ||
         abs(dot(direction * (h.t - hitT), hitNormal)) > kDecalReach)
         return false;
     GeometryRecord record = Records[h.record];
@@ -948,6 +953,59 @@ uint ProbeAt(uint2 pixel)
     return kNoProbe;
 }
 
+// The triangles a probe pixel's camera ray crosses, the nearest kProbeCandidates in order (4 uints each after the
+// probe's 24, at `base` + 96; rt_core.cpp LogProbes): its record, its distance, its part flags, the side the ray
+// meets (bit 8: the front), whether the camera's trace takes it there (bit 9: an opaque part, culling aside, or a
+// non-opaque one AlphaSolid keeps for the camera) and its alpha mask there (bits 16-23), and its material. Every
+// triangle is traced as non-opaque, back faces too, so that none is left out unseen. Sorted in place in Stats (zeroed
+// every frame: an empty slot's distance is 0; only this probe's thread writes its slots), not in local arrays that
+// would weigh on the whole pass.
+void RecordProbeCandidates(RayDesc ray, float coneSpread, uint base)
+{
+    uint slots = base + 96;
+    RayQuery<RAY_FLAG_FORCE_NON_OPAQUE> query;
+    query.TraceRayInline(Scene, RAY_FLAG_NONE, 0x01, ray);
+    while (query.Proceed())
+    {
+        float t = query.CandidateTriangleRayT();
+        uint at = 0;
+        for (; at < kProbeCandidates; ++at)
+        {
+            uint stored = Stats.Load(slots + at * 16 + 4);
+            if (stored == 0 || asfloat(stored) > t)
+                break;
+        }
+        if (at == kProbeCandidates)
+            continue;  // farther than the nearest kProbeCandidates
+        uint recordIndex = query.CandidateInstanceID() + query.CandidateGeometryIndex();
+        GeometryRecord record = Records[recordIndex];
+        MaterialRecord material = Materials[record.Material];
+        bool nonOpaque = (record.Flags & (1 | 4 | kPartDecal)) != 0;  // scene.h kPartNonOpaque
+        bool taken = !nonOpaque ||
+                     AlphaSolid(query.CandidateInstanceIndex(), query.CandidateInstanceID(),
+                                query.CandidateGeometryIndex(), query.CandidatePrimitiveIndex(),
+                                query.CandidateTriangleBarycentrics(), coneSpread * t,
+                                query.CandidateInstanceContributionToHitGroupIndex() != 0, true);
+        float mask = 1;
+        if (material.Textures.w != kAlphamaskSlotNone)
+        {
+            uint3 corners = LoadTriangle(record, query.CandidatePrimitiveIndex());
+            float2 b = query.CandidateTriangleBarycentrics();
+            float2 uv = (1 - b.x - b.y) * LoadUv(record, corners.x) + b.x * LoadUv(record, corners.y) +
+                        b.y * LoadUv(record, corners.z);
+            mask = SampleTexture(material.Textures.w, uv, log2(max(coneSpread * t, 1e-9)) - 6).r;
+        }
+        uint4 entry = uint4(recordIndex, asuint(t),
+                            (record.Flags & 0xFF) | (query.CandidateTriangleFrontFace() ? 0x100u : 0u) |
+                                (taken ? 0x200u : 0u) | (uint(saturate(mask) * 255 + 0.5) << 16),
+                            record.Material);
+        // The farther ones move back by one (the last falls off).
+        for (uint k = kProbeCandidates - 1; k > at; --k)
+            Stats.Store4(slots + k * 16, Stats.Load4(slots + (k - 1) * 16));
+        Stats.Store4(slots + at * 16, entry);
+    }
+}
+
 uint PackUnorm4(float4 v)
 {
     uint4 b = uint4(round(saturate(v) * 255));
@@ -1145,7 +1203,8 @@ float3 SpecularDirection(float3 N, float3 V, float gloss, float u1, float u2)
 // Next-event estimation of the listed lights (lights.hlsli,
 // emissive_lights.hlsl: emissive triangles and the game's lamps), resampled
 // after ReSTIR DI, for points inside the light grid (farther ones leave
-// emitters to the paths that hit them; lamps rarely reach that far):
+// emitters to the paths that hit them, and the game's lamp passes light them;
+// with the light tree the grid's coarse levels reach every point):
 // kLightCandidates new candidates from the point's light-grid cell (a uniform
 // point of a triangle, a point of a lamp's disc), and the samples the previous
 // lit frame kept near this point (at a pixel of its 4x4 tile there, permuted
@@ -1238,22 +1297,61 @@ uint LightCell(float3 position)
     return ((uint)coordinates.z * kLightGridSize + (uint)coordinates.y) * kLightGridSize + (uint)coordinates.x;
 }
 
-// `count` new candidates from the slots of the cells around `position` (a uniform point of a triangle, a point
-// of a lamp's disc), weighed by their unshadowed diffuse contribution there (LightTarget) over their probability.
-// Each candidate's cell is the one of a point up to half a cell from `position` on each axis (a stochastic
-// blend of the cells: their borders do not show; emissive_lights.hlsl builds each cell for the points that far
-// from it, kLightCellReach).
+static uint g_levelDraws = 0;  // this thread's candidates from the light grid's coarse levels (statistic 120)
+static uint g_levelWalks = 0;  // of them, those drawn from the light tree itself: their cell not filled (121)
+
+// `count` new candidates (a uniform point of a triangle, a point of a lamp's disc), weighed by their unshadowed
+// diffuse contribution at `position` (LightTarget) over their probability: from the slots of the light-grid
+// cells around `position`, with the light tree (LightTreeOn) beyond the fine level those of its coarse levels
+// (light_tree.hlsli), each candidate's cell marked as taken (the next frames fill it: emissive_lights.hlsl pass
+// 20); where this frame did not fill it, from the tree itself (TreeLight, by importance at the point). Each
+// candidate's cell is the one of a point up to half a cell from `position` on each axis (a stochastic blend of the
+// cells: their borders do not show; emissive_lights.hlsl builds each cell for the points that far from it,
+// kLightCellReach).
 void LightCandidates(inout LightChoice choice, uint count, float3 position, float3 N, float3 geometricNormal,
                      inout uint seed)
 {
     choice.candidates += count;
+    uint level = LightTreeOn != 0 ? PointLevel(position) : 0;
+    float levelCellSize = level != 0 ? LevelCellSize(level) : 0;
+    uint markedCell = kNoLight;  // the coarse cell this point marked last (one mark per cell)
     for (uint c = 0; c < count; ++c)
     {
-        float3 jitter = (float3(Random(seed), Random(seed), Random(seed)) - 0.5) * kLightCellSize;
-        uint cell = LightCell(Mode != 14 ? position + jitter : position);  // mode 14: P2p's grid
-        uint2 slot = LightGrid[cell * kLightSlots + min((uint)(Random(seed) * kLightSlots), kLightSlots - 1)];
-        uint index = slot.x;
-        float choiceWeight = asfloat(slot.y);  // the light's unbiased contribution weight (about 1 / its probability)
+        uint index = kNoLight;
+        float choiceWeight = 0;  // the light's unbiased contribution weight (about 1 / its probability)
+        if (level != 0)
+        {
+            ++g_levelDraws;
+            float3 jitter = (float3(Random(seed), Random(seed), Random(seed)) - 0.5) * levelCellSize;
+            uint levelCell = LevelCell(level, position + jitter);
+            uint slotPick = min((uint)(Random(seed) * kLightSlots), kLightSlots - 1);
+            if (levelCell != markedCell)
+            {
+                LightTree.Store(kTreeLevelUsed + levelCell * 4, Frame);
+                markedCell = levelCell;
+            }
+            if (LightTree.Load(kTreeLevelFilled + levelCell * 4) == Frame)
+            {
+                uint2 slot = LightTree.Load2(kTreeLevelSlots + (levelCell * kLightSlots + slotPick) * 8);
+                index = slot.x;
+                choiceWeight = asfloat(slot.y);
+            }
+            else
+            {
+                ++g_levelWalks;
+                float probability;
+                if (TreeLight(position, N, 0, 0.01, seed, index, probability))
+                    choiceWeight = 1 / probability;
+            }
+        }
+        else
+        {
+            float3 jitter = (float3(Random(seed), Random(seed), Random(seed)) - 0.5) * kLightCellSize;
+            uint cell = LightCell(Mode != 14 ? position + jitter : position);  // mode 14: P2p's grid
+            uint2 slot = LightGrid[cell * kLightSlots + min((uint)(Random(seed) * kLightSlots), kLightSlots - 1)];
+            index = slot.x;
+            choiceWeight = asfloat(slot.y);
+        }
         float u1 = Random(seed);
         float u2 = Random(seed);
         float u3 = Random(seed);
@@ -1350,7 +1448,7 @@ float3 SampledLight(uint2 pixel, float3 surfacePoint, float3 previousPoint, floa
         return 0;
     }
     // Inside the grid by the surface point, as the patched lamp passes of the game test it (InLightGrid).
-    bool inGrid = InLightGrid(surfacePoint);
+    bool inGrid = LightTreeOn != 0 || InLightGrid(surfacePoint);  // the tree has no extent
     info.inGrid = inGrid;
     if (!inGrid)
     {
@@ -1488,7 +1586,7 @@ float3 BounceLight(float3 surfacePoint, float3 position, MaterialSample m, float
 {
     specular = 0;
     status = 0;
-    if (!LightsActive() || !InLightGrid(surfacePoint))
+    if (!LightsActive() || !(LightTreeOn != 0 || InLightGrid(surfacePoint)))
         return 0;
     LightChoice choice = NoLightChoice();
     LightCandidates(choice, kBounceCandidates, position, m.normal, geometricNormal, seed);
@@ -1887,6 +1985,8 @@ void main(uint3 id : SV_DispatchThreadID)
         Count(101, hit && decals.count > 0);
         Count(102, hit && decalApplied);
         Count(103, hit && decals.dropped > 0);
+        // Hits on a cutout decal that lay within the game's decal depth bias behind the closest surface.
+        Count(122, hit && decals.behind != 0);
         // Projected decals (ApplyProjectedDecals): hits inside one's box, changed by one, inside more than
         // kMaxPointDecals; compared pixels one changed, of them those whose base color is within 0.05 and 0.02 of
         // the G-buffer's (which the game's decal pass blended them into), whose normal is within 15 and 5 degrees.
@@ -1980,6 +2080,7 @@ void main(uint3 id : SV_DispatchThreadID)
             Stats.Store4(base + 80, uint4(PackUnorm4(float4(material.paintMask, material.coloring, material.ao,
                                                             material.emissive)),
                                           asuint(rayZ), asuint(rasterZ), (record.Flags & 0xFF) | (s.record.Flags << 8)));
+            RecordProbeCandidates(ray, coneSpread, base);
         }
         if (Mode == 4)
         {
@@ -2135,6 +2236,14 @@ void main(uint3 id : SV_DispatchThreadID)
                 {
                     Stats.InterlockedAdd(15 * 4, openWave.x);
                     Stats.InterlockedAdd(63 * 4, openWave.y);
+                }
+                // 120, 121: this pixel's candidates from the grid's coarse levels, of them those drawn from the
+                // light tree itself (their cell not filled this frame).
+                uint2 levelWave = WaveActiveSum(uint2(g_levelDraws, g_levelWalks));
+                if (WaveIsFirstLane() && levelWave.x != 0)
+                {
+                    Stats.InterlockedAdd(120 * 4, levelWave.x);
+                    Stats.InterlockedAdd(121 * 4, levelWave.y);
                 }
             }
             else

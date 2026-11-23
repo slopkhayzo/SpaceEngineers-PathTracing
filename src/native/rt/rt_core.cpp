@@ -60,23 +60,26 @@ constexpr DXGI_FORMAT kRrFormats[7] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORM
 constexpr UINT kPageDescriptorsStart = static_cast<UINT>(kFramesInFlight) * kDescriptorsPerFrame;
 constexpr UINT kTextureDescriptorsStart = kPageDescriptorsStart + kMaxGeometryPages;
 constexpr UINT64 kConstantsStride = 512;
-// Per frame: 112 counters (debug_view.hlsl, primary_view.hlsl; some of them
-// emissive_lights.hlsl's), then the probe records of primary_view.hlsl (24
-// uints each).
-constexpr std::size_t kStatsCounters = 112;
+// Per frame: 128 counters (debug_view.hlsl, primary_view.hlsl; some of them
+// emissive_lights.hlsl's), then the probe records of primary_view.hlsl (48
+// uints each: what the ray hit, then the triangles it crosses).
+constexpr std::size_t kStatsCounters = 128;
 constexpr std::size_t kMaxProbes = 8;
-constexpr std::size_t kProbeWords = 24;
+constexpr std::size_t kProbeWords = 48;
+constexpr std::size_t kProbeCandidates = 6;  // primary_view.hlsl RecordProbeCandidates, 4 uints each after 24
 constexpr std::uint32_t kNoProbe = 0xFFFFFFFFu;
 constexpr UINT64 kProbeOffset = kStatsCounters * 4;
 constexpr UINT64 kStatsBytes = kProbeOffset + kMaxProbes * kProbeWords * 4;
-static_assert(kStatsBytes == 1216);  // primary_view.hlsl kProbeOffset = 448
-constexpr UINT64 kStatsBufferBytes = 4096;  // stats, zeros and readback buffers
+static_assert(kStatsBytes == 2048);  // primary_view.hlsl kProbeOffset = 512, kProbeBytes = 192
+constexpr UINT64 kStatsBufferBytes = 8192;  // stats, zeros and readback buffers
 constexpr float kFarPlane = 1.0e8f;
 constexpr UINT64 kReadbackStatsStride = kStatsBytes;
 constexpr UINT64 kReadbackTimestampsOffset = kReadbackStatsStride * kFramesInFlight;
 // Per frame: the list's start, the scene mirror's end (texture uploads, mesh and skinned objects' BLASes, the
-// TLAS), the light list's end (BuildLights; right after the scene mirror's in the other views), the list's end.
-constexpr UINT kTimestampsPerFrame = 4;
+// TLAS), the light list's end (BuildLights; right after the scene mirror's in the other views), the list's end;
+// within the light list, the ends of its phases (the list and the cells' lists, the light tree, its coarse cells;
+// the light grid's slots follow), at the light list's end in the other views.
+constexpr UINT kTimestampsPerFrame = 7;
 constexpr double kReportSeconds = 5.0;
 constexpr double kWatchdogSeconds = 2.0;
 // How long the gate waits for a slot still in flight before it skips the frame's D3D12 work (WaitForSlot).
@@ -112,6 +115,19 @@ static_assert(kLightKeySlots >= kLightCells * kLightWeightBins / 2, "the reset p
 constexpr UINT64 kReservoirBytes = 16;  // LightReservoirs: per pixel and set
 constexpr std::size_t kLightCountersBuffer = 2;
 constexpr UINT64 kLightArgumentsOffset = 16;  // LightCounters word 4
+// The light tree (u27, light_tree.hlsli): its largest leaf count, the sort's largest size and its chunk in
+// shared memory; the light grid's coarse levels' cells, which the tree fills, and the groups of their slots'
+// pass (emissive_lights.hlsl kLevelSlotGroups); the buffer's size (the keys, the leaves' records, the nodes, the
+// parents, the visit counters; the coarse cells' slots, their marks of use and fill, the list of those to fill).
+constexpr UINT kTreeMaxLeaves = 73728;
+constexpr UINT kTreeMaxKeys = 131072;
+constexpr UINT kTreeSortChunk = 1024;
+constexpr UINT kLightLevelCells = 4 * kLightCells;
+constexpr UINT kLevelSlotGroups = 512;
+constexpr UINT64 kTreeBytes = static_cast<UINT64>(kTreeMaxKeys) * 8 + static_cast<UINT64>(kTreeMaxLeaves) * 48 +
+                              static_cast<UINT64>(kTreeMaxLeaves) * 96 + static_cast<UINT64>(kTreeMaxLeaves) * 12 +
+                              static_cast<UINT64>(kLightLevelCells) * 16 * 8 +
+                              static_cast<UINT64>(kLightLevelCells) * 12;
 
 const wchar_t* ModeName(const int mode) {
     switch (mode) {
@@ -310,8 +326,12 @@ struct PrimaryConstants {
     std::uint32_t decalCount;          // SceneFrame::decalCount (0: no projected decals bound)
     std::uint32_t decalLights;         // Options::decalLights, SetDecalLights
     std::uint32_t openGeneration;      // g.seenThrough: the entries this generation wrote count (kOpenGenerationFrames)
+    std::uint32_t lightTreeOn;         // Options::lightTree, SetLightTree: the grid's coarse levels (the tree)
+    float decalDepthBias;              // the game's decal depth bias as a share of the view depth (FillPrimaryConstants)
 };
-static_assert(sizeof(PrimaryConstants) == 372);
+static_assert(sizeof(PrimaryConstants) == 380);
+static_assert(offsetof(PrimaryConstants, lightTreeOn) == offsetof(PrimaryConstants, openGeneration) + 4);
+static_assert(offsetof(PrimaryConstants, decalDepthBias) == offsetof(PrimaryConstants, lightTreeOn) + 4);
 static_assert(offsetof(PrimaryConstants, emissiveIntensity) == offsetof(PrimaryConstants, fullCoverage) + 4);
 static_assert(offsetof(PrimaryConstants, decalCount) == offsetof(PrimaryConstants, emissiveIntensity) + 4);
 static_assert(offsetof(PrimaryConstants, decalLights) == offsetof(PrimaryConstants, decalCount) + 4);
@@ -363,6 +383,8 @@ struct Stats {
     std::vector<double> d3d12Ms;  // the D3D12 command list itself (D3D12 timestamps)
     std::vector<double> sceneMs;  // its scene mirror part (kTimestampsPerFrame)
     std::vector<double> lightsMs; // its light list part (BuildLights; lit views)
+    std::array<double, 4> lightPhaseMs{};  // summed: the list, the light tree, its coarse cells, the grid's slots
+    UINT64 lightPhaseFrames = 0;
     std::array<UINT64, 5> reprojection{};  // compared, < 0.1 %, < 1 %, >= 1 %, left the screen
     std::array<UINT64, kStatsCounters> traced{};  // primary_view.hlsl counters
     UINT64 sceneInstances = 0;             // TLAS instances, summed over the traced frames
@@ -378,6 +400,8 @@ struct State {
     std::atomic<int> requestedMode{-1};
     std::atomic<int> debugView{static_cast<int>(DebugView::stripes)};
     std::atomic<bool> decalLights{true};  // Options::decalLights, SetDecalLights
+    std::atomic<bool> lightTree{false};   // Options::lightTree, SetLightTree: the grid's coarse levels (the tree)
+    std::atomic<UINT> treeLeaves{0};      // the light tree's leaves in the latest frame read back (its sort's size)
     std::atomic<UINT64> fenceValue{0};
     std::atomic<ID3D11CommandList*> lightingList{nullptr};
 
@@ -408,6 +432,9 @@ struct State {
     // surfaces through a face of their own object (whose open faces then let light through to them). Zeroed at
     // creation, generations start at 1; COMMON between frames (promoted to UNORDERED_ACCESS by the traced views).
     ComPtr<ID3D12Resource> seenThrough;
+    // The light tree and the grid's coarse levels (u27, light_tree.hlsli: built and filled by BuildLights, read by
+    // the lit views); COMMON between frames.
+    ComPtr<ID3D12Resource> lightTreeBuffer;
     bool sceneReady = false;
     bool texturesReady = false;
     ComPtr<ID3D12DescriptorHeap> heap;
@@ -442,6 +469,7 @@ struct State {
     SRWLOCK targetLock = SRWLOCK_INIT;
     SharedTexture overlay;   // RGBA16F, read by the patched LightDir.hlsl at t22
     ComPtr<ID3D11ShaderResourceView> lampScale;  // 1x1 RG32F, the patched lamp passes' t23 (BindLighting)
+    ComPtr<ID3D11ShaderResourceView> lampScaleTree;  // the same with the light tree on (y 2: lamps traced everywhere)
     SharedTexture replace;   // the lit HDR target's format, copied over it after the lighting
     SharedTexture viewZ;     // pack outputs
     SharedTexture normalRoughness;
@@ -622,8 +650,9 @@ bool CreatePipelines() {
     // (t13), the light list's buffers (u9-u16), the objects' part overrides
     // (t14), the pixels' light samples (u17), the frame's lamps (t15), the
     // instances' previous transforms (t16), the projected decals' TLAS (t17)
-    // and records (t18), the records seen through their own faces (u26) and
-    // a linear wrap sampler (s0).
+    // and records (t18), the records seen through their own faces (u26), the
+    // light tree (u27; again at u28, read through the caches where u27 is
+    // coherent: emissive_lights.hlsl) and a linear wrap sampler (s0).
     const D3D12_DESCRIPTOR_RANGE ranges[4] = {
         {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 0, 0},
         {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 9, 0, 0, 4},
@@ -632,7 +661,7 @@ bool CreatePipelines() {
     };
     const D3D12_DESCRIPTOR_RANGE pageRange{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kMaxGeometryPages, 0, 1, 0};
     const D3D12_DESCRIPTOR_RANGE textureRange{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kMaxTextureDescriptors, 0, 2, 0};
-    D3D12_ROOT_PARAMETER parameters[27]{};
+    D3D12_ROOT_PARAMETER parameters[29]{};
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     parameters[0].Descriptor.ShaderRegister = 0;
     parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -679,6 +708,10 @@ bool CreatePipelines() {
     parameters[25].Descriptor.ShaderRegister = 18;  // the projected decals' records
     parameters[26].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
     parameters[26].Descriptor.ShaderRegister = 26;  // the records seen through their own faces (primary_view.hlsl)
+    parameters[27].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    parameters[27].Descriptor.ShaderRegister = 27;  // the light tree (light_tree.hlsli)
+    parameters[28].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    parameters[28].Descriptor.ShaderRegister = 28;  // the same, its walks' view (emissive_lights.hlsl)
     D3D12_STATIC_SAMPLER_DESC sampler{};
     sampler.Filter = D3D12_FILTER_ANISOTROPIC;
     sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
@@ -687,7 +720,7 @@ bool CreatePipelines() {
     sampler.MaxAnisotropy = 8;
     sampler.MaxLOD = D3D12_FLOAT32_MAX;
     sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    const D3D12_ROOT_SIGNATURE_DESC rootDesc{27, parameters, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    const D3D12_ROOT_SIGNATURE_DESC rootDesc{29, parameters, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_NONE};
     ComPtr<ID3DBlob> blob;
     ComPtr<ID3DBlob> errors;
     HRESULT hr = D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors);
@@ -767,6 +800,11 @@ bool CreatePipelines() {
         g.seenThrough = CreateBuffer(static_cast<UINT64>(kMaxGeometryRecords) * 4, D3D12_HEAP_TYPE_DEFAULT,
                                      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
         hr = g.seenThrough ? S_OK : E_OUTOFMEMORY;
+    }
+    if (SUCCEEDED(hr)) {
+        g.lightTreeBuffer = CreateBuffer(kTreeBytes, D3D12_HEAP_TYPE_DEFAULT,
+                                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+        hr = g.lightTreeBuffer ? S_OK : E_OUTOFMEMORY;
     }
     if (SUCCEEDED(hr)) {
         const D3D12_RANGE none{0, 0};
@@ -1051,6 +1089,10 @@ void FillPrimaryConstants(PrimaryConstants& constants, const UINT64 frame, const
     constants.screenRayTerms[3] = p[9] / p[5];
     // Reverse-Z: depth 1 at the near plane, view depth = M43 / (depth + M33) (pack_gbuffer.hlsl).
     constants.nearPlane = p[14] / (1.0f + p[10]);
+    // The game draws its decals' depth 0.0001 nearer in clip space (Geometry/Passes/GBuffer/VertexStage.hlsli):
+    // depth = (M43 + 0.0001) / z - M33, so a decal at view depth z_d wins over a surface at z_s while
+    // z_d <= z_s (1 + 0.0001 / M43). The camera's rays take that share (scene_common.hlsli TraceClosestDecals).
+    constants.decalDepthBias = p[14] > 0.0f ? 0.0001f / p[14] : 0.0f;
     constants.farPlane = kFarPlane;
     constants.mode = static_cast<std::uint32_t>(view - static_cast<int>(DebugView::parts));
     constants.frame = static_cast<std::uint32_t>(frame);
@@ -1149,25 +1191,43 @@ void FillViewConstants(ViewConstants& constants, const UINT64 frame, const int v
     constants.hasPrevious = hasPrevious ? 1u : 0u;
 }
 
+// The light tree's sort size: a power of two from two chunks to kTreeMaxKeys, above the leaves of the latest
+// lit frame read back with half again to spare (leaves past it this frame are left out of the tree: statistic
+// 116; the next frames' sort is wider).
+UINT TreeSortSize() {
+    const UINT leaves = g.treeLeaves.load();
+    const UINT wanted = leaves + leaves / 2 + 256;
+    UINT size = 2 * kTreeSortChunk;
+    while (size < wanted && size < kTreeMaxKeys) {
+        size <<= 1;
+    }
+    return size;
+}
+
 // The lit views' light list (emissive_lights.hlsl, research/docs/space-engineers-rt-plan.md §6.9), on
 // the frame's root arguments, before the primary pass reads it: the materials' emission when the
 // material table changed, then the emissive parts of the TLAS instances, their triangles
 // (ExecuteIndirect: one group per part, counted on the GPU) and the cells near them (the same groups),
-// the lamps after them (and their cells), the weights' prefix sums and the light grid.
-void BuildLights(const SceneFrame& scene, const bool powerGrid) {
-    // The light list's buffers and the pixels' light samples (read and written by the primary pass).
-    std::array<D3D12_RESOURCE_BARRIER, 9> barriers{};
+// the lamps after them (and their cells), the weights' prefix sums and the light grid; with the light tree
+// (`tree`, P2z) also the tree and the grid's coarse levels from it. Its phases' ends as the frame's timestamps
+// 4-6 (`queryBase`: the frame's first).
+void BuildLights(const SceneFrame& scene, const bool powerGrid, const bool tree, const UINT queryBase) {
+    // The light list's buffers, the pixels' light samples (read and written by the primary pass) and the tree.
+    std::array<D3D12_RESOURCE_BARRIER, 10> barriers{};
     for (std::size_t i = 0; i < barriers.size(); ++i) {
         barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        barriers[i].Transition.pResource = i < g.lights.size() ? g.lights[i].Get() : g.reservoirs.Get();
+        barriers[i].Transition.pResource = i < g.lights.size()       ? g.lights[i].Get()
+                                           : i == g.lights.size()    ? g.reservoirs.Get()
+                                                                     : g.lightTreeBuffer.Get();
         barriers[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         barriers[i].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;  // buffers decay to it after every frame
         barriers[i].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     }
     g.list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
     g.list->SetPipelineState(g.lightsPipeline.Get());
-    const auto pass = [](const UINT step, const UINT count, const UINT first, const UINT groups) {
-        const UINT values[4] = {step, count, first, 0};
+    const auto pass = [](const UINT step, const UINT count, const UINT first, const UINT groups,
+                         const UINT option = 0) {
+        const UINT values[4] = {step, count, first, option};
         g.list->SetComputeRoot32BitConstants(10, 4, values, 0);
         g.list->Dispatch(groups, 1, 1);
         UavBarrier(g.list.Get(), nullptr);
@@ -1180,7 +1240,12 @@ void BuildLights(const SceneFrame& scene, const bool powerGrid) {
         g.lightMaterialsVersion = scene.materialsVersion;
     }
     pass(1, 0, 0, kLightKeySlots / kLightGroupSize);                           // reset: counters, key table
-    pass(2, scene.instances, 0, (scene.instances + kLightGroupSize - 1) / kLightGroupSize);  // parts
+    // The emissive parts within the grid's reach (all of them for the tree), the nearest first: counted by
+    // distance (pass 2, First 0), the distance bins that fit the list (pass 12), then listed (pass 2, First 1).
+    const UINT instanceGroups = (scene.instances + kLightGroupSize - 1) / kLightGroupSize;
+    pass(2, scene.instances, 0, instanceGroups, tree ? 1u : 0u);
+    pass(12, scene.lampCount, 0, 1);
+    pass(2, scene.instances, 1, instanceGroups, tree ? 1u : 0u);
     pass(3, scene.lampCount, 0, 1);                                            // arguments
     ID3D12Resource* counters = g.lights[kLightCountersBuffer].Get();
     Transition(counters, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
@@ -1213,6 +1278,32 @@ void BuildLights(const SceneFrame& scene, const bool powerGrid) {
     }
     pass(6, 0, 0, kLightScanBlocks);                  // block prefix sums
     pass(7, 0, 0, 1);                                 // block offsets, total power
+    g.list->EndQuery(g.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 4);
+    if (!tree) {
+        g.list->EndQuery(g.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 5);
+    }
+    if (tree) {
+        // The light tree (light_tree.hlsli): the leaves' records and the bounds of their centres (13), their keys
+        // (14), the bitonic sort (15: the chunks; per wider stage its wide steps, 16, then its narrow ones, 17),
+        // the internal nodes (18) and their slots from the leaves up (19); the grid's coarse cells the points took
+        // in the latest frames (20) and their slots from the tree (21).
+        const UINT size = TreeSortSize();
+        pass(13, scene.lampCount, 0, std::min(size, kTreeMaxLeaves) / kLightGroupSize);  // (the sort takes no more)
+        pass(14, size, 0, size / kLightGroupSize);
+        pass(15, 0, 0, size / kTreeSortChunk);
+        for (UINT stage = 2 * kTreeSortChunk; stage <= size; stage <<= 1) {
+            for (UINT step = stage >> 1; step >= kTreeSortChunk; step >>= 1) {
+                pass(16, stage, step, size / 2 / kLightGroupSize);
+            }
+            pass(17, stage, 0, size / kTreeSortChunk);
+        }
+        pass(18, 0, 0, size / kLightGroupSize);
+        pass(19, 0, 0, size / kLightGroupSize);
+        g.list->EndQuery(g.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 5);
+        pass(20, 0, 0, kLightLevelCells / kLightGroupSize);
+        pass(21, 0, 0, kLevelSlotGroups);
+    }
+    g.list->EndQuery(g.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 6);
     // The light grid (powerGrid: P2p's, lights drawn by power alone, for the emitters-power-grid view).
     const UINT grid[4] = {8, 0, 0, powerGrid ? 1u : 0u};
     g.list->SetComputeRoot32BitConstants(10, 4, grid, 0);
@@ -1356,12 +1447,14 @@ void RecordFrame(const UINT64 frame, const int mode, const int requestedView) {
     // around this frame's camera. Released meshes are freed once this
     // frame's "done" signal (the next fence value) has passed.
     SceneFrame scene;
+    const bool tree = g.lightTree.load();  // the light tree this frame (lamps uploaded at any distance)
     if (g.texturesReady) {
         TexturesRecord(g.list.Get(), index);
     }
     if (g.sceneReady) {
         scene = SceneRecord(g.list.Get(), index, g.frame.cameraPosition,
-                            g.previousFrameValid ? g.previousFrame.cameraPosition : nullptr, g.fenceValue.load() + 1);
+                            g.previousFrameValid ? g.previousFrame.cameraPosition : nullptr, g.fenceValue.load() + 1,
+                            tree);
     }
     g.list->EndQuery(g.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 1);
     const bool traced = IsTraced(view) && scene.tlas != 0;
@@ -1560,6 +1653,7 @@ void RecordFrame(const UINT64 frame, const int mode, const int requestedView) {
         constants.emissiveIntensity = g.options.emissiveIntensity;
         constants.decalCount = scene.decalTlas != 0 ? scene.decalCount : 0u;
         constants.decalLights = g.decalLights.load() ? 1u : 0u;
+        constants.lightTreeOn = tree ? 1u : 0u;
         constants.openGeneration = static_cast<std::uint32_t>(1 + static_cast<UINT64>(frame) / kOpenGenerationFrames);
         // Full coverage: no depth test against the game's (unjittered) G-buffer, so the primary rays can move
         // within their pixels from frame to frame (anti-aliasing through the history or Ray Reconstruction).
@@ -1603,6 +1697,7 @@ void RecordFrame(const UINT64 frame, const int mode, const int requestedView) {
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = g.heap->GetGPUDescriptorHandleForHeapStart();
     gpu.ptr += static_cast<UINT64>(index) * kDescriptorsPerFrame * g.descriptorSize;
     g.list->SetComputeRootDescriptorTable(1, gpu);
+    bool lightPhases = false;  // BuildLights wrote the timestamps of its phases
     if (traced) {
         g.list->SetComputeRootShaderResourceView(2, scene.tlas);
         g.list->SetComputeRootShaderResourceView(3, scene.records);
@@ -1627,6 +1722,8 @@ void RecordFrame(const UINT64 frame, const int mode, const int requestedView) {
         g.list->SetComputeRootShaderResourceView(24, decals ? scene.decalTlas : scene.tlas);
         g.list->SetComputeRootShaderResourceView(25, decals ? scene.decals : scene.instanceData);
         g.list->SetComputeRootUnorderedAccessView(26, g.seenThrough->GetGPUVirtualAddress());
+        g.list->SetComputeRootUnorderedAccessView(27, g.lightTreeBuffer->GetGPUVirtualAddress());
+        g.list->SetComputeRootUnorderedAccessView(28, g.lightTreeBuffer->GetGPUVirtualAddress());
         for (UINT i = 0; i < static_cast<UINT>(g.lights.size()); ++i) {
             g.list->SetComputeRootUnorderedAccessView(12 + i, g.lights[i]->GetGPUVirtualAddress());
         }
@@ -1635,9 +1732,13 @@ void RecordFrame(const UINT64 frame, const int mode, const int requestedView) {
             21, (g.reservoirs ? g.reservoirs : g.lights[kLightCountersBuffer])->GetGPUVirtualAddress());
         g.stats.sceneInstances += scene.instances;
         if (litView && g.reservoirs) {
-            BuildLights(scene, view == static_cast<int>(DebugView::emittersPowerGrid));
+            BuildLights(scene, view == static_cast<int>(DebugView::emittersPowerGrid), tree, queryBase);
             g.list->SetPipelineState(g.primaryPipeline.Get());
+            lightPhases = true;
         }
+    }
+    for (UINT stamp = 4; stamp < kTimestampsPerFrame && !lightPhases; ++stamp) {
+        g.list->EndQuery(g.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + stamp);
     }
     g.list->EndQuery(g.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 2);
     g.list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
@@ -1736,6 +1837,14 @@ void PollReadbacks() {
             g.stats.sceneMs.push_back(static_cast<double>(stamps[1] - stamps[0]) * tick);
             if (LitView(slot.view)) {
                 g.stats.lightsMs.push_back(static_cast<double>(stamps[2] - stamps[1]) * tick);
+                // The light list's phases (BuildLights): from the scene mirror's end to stamps 4, 5, 6 and 2.
+                const UINT64 ends[5] = {stamps[1], stamps[4], stamps[5], stamps[6], stamps[2]};
+                if (ends[1] >= ends[0] && ends[2] >= ends[1] && ends[3] >= ends[2] && ends[4] >= ends[3]) {
+                    for (std::size_t phase = 0; phase < g.stats.lightPhaseMs.size(); ++phase) {
+                        g.stats.lightPhaseMs[phase] += static_cast<double>(ends[phase + 1] - ends[phase]) * tick;
+                    }
+                    ++g.stats.lightPhaseFrames;
+                }
             }
         }
         if (slot.view == static_cast<int>(DebugView::reprojection)) {
@@ -1745,6 +1854,11 @@ void PollReadbacks() {
         } else if (IsTraced(slot.view)) {
             for (std::size_t i = 0; i < g.stats.traced.size(); ++i) {
                 g.stats.traced[i] += counters[i];
+            }
+            // The light list of a lit frame (emissive_lights.hlsl 24, 31, 51: its parts, its frames, its lamps):
+            // the leaves the light tree's sort must take (TreeSortSize).
+            if (counters[31] != 0) {
+                g.treeLeaves.store(std::min<UINT>(counters[24], static_cast<UINT>(kMaxLightParts)) + counters[51]);
             }
             // The clay view's probes: the shadow caster between a probed point and the camera (primary_view.hlsl).
             if ((ShadesMaterials(slot.view) || slot.view == static_cast<int>(DebugView::clay)) &&
@@ -1819,6 +1933,34 @@ void LogProbes() {
                     MaterialColor(r[14]).c_str(), unit16(r[16], 0), unit16(r[16], 16), unit8(r[20], 24),
                     (r[0] & 32u) != 0 ? L"above 0" : L"0", unit16(r[17], 0) * 2.0f - 1.0f,
                     unit16(r[17], 16) * 2.0f - 1.0f, unit8(r[20], 0), unit8(r[20], 8), unit8(r[20], 16), r[8], r[9]));
+        // The triangles the ray crosses, nearest first (primary_view.hlsl RecordProbeCandidates; none: zeros).
+        for (std::size_t c = 0; c < kProbeCandidates; ++c) {
+            const std::uint32_t* e = r + 24 + c * 4;
+            if (e[1] == 0) {
+                break;
+            }
+            const std::uint32_t flags = e[2];
+            std::wstring part;
+            if ((flags & 32u) != 0) {
+                part = L"cutout decal";
+            } else if ((flags & 8u) != 0) {
+                part = (flags & 16u) != 0 ? L"blended decal (premultiplied)" : L"blended decal";
+            } else if ((flags & 1u) != 0) {
+                part = L"alpha-masked";
+            } else {
+                part = L"opaque";
+            }
+            if ((flags & 2u) != 0) {
+                part += L", double-sided";
+            }
+            if ((flags & 4u) != 0) {
+                part += L", hideable";
+            }
+            Info(Format(L"probe %u: crosses at %.4f record %u, %s, %s, %s, mask %.2f; material %u %s.", p,
+                        AsFloat(e[1]), e[0], part.c_str(), (flags & 0x100u) != 0 ? L"front face" : L"back face",
+                        (flags & 0x200u) != 0 ? L"taken" : L"passed through", unit8(flags, 16), e[3],
+                        SceneMaterialName(e[3]).c_str()));
+        }
     }
 }
 
@@ -1971,12 +2113,17 @@ void Report(const wchar_t* reason) {
     }
     if (s.traced[100] != 0 || s.traced[103] != 0) {
         // primary_view.hlsl 100-103: hits on cutout decals; hits whose camera ray met blended decals, whose
-        // material one changed (ApplyDecal), whose ray met more than one; of all hits (8).
+        // material one changed (ApplyDecal), whose ray met more than one; of all hits (8). 122: hits on a cutout
+        // decal within the game's decal depth bias behind the closest surface (scene_common.hlsli
+        // TraceClosestDecals).
         const auto& t = s.traced;
         const double hits = t[8] != 0 ? static_cast<double>(t[8]) : 1.0;
-        Info(Format(L"decals: the camera's rays hit cutout decals on %.2f %% of the hits; they met blended decals "
-                    L"on %.3f %%, which changed the material on %.3f %%; more than one met on %.3f %%.",
-                    100.0 * static_cast<double>(t[100]) / hits, 100.0 * static_cast<double>(t[101]) / hits,
+        const float m43 = g.frame.projection[14];
+        Info(Format(L"decals: the camera's rays hit cutout decals on %.2f %% of the hits (%.2f %% lying on their "
+                    L"surface or within the game's decal depth bias, %.3f %% of the view depth, behind it); they met "
+                    L"blended decals on %.3f %%, which changed the material on %.3f %%; more than one met on %.3f %%.",
+                    100.0 * static_cast<double>(t[100]) / hits, 100.0 * static_cast<double>(t[122]) / hits,
+                    m43 > 0.0f ? 0.01 / static_cast<double>(m43) : 0.0, 100.0 * static_cast<double>(t[101]) / hits,
                     100.0 * static_cast<double>(t[102]) / hits, 100.0 * static_cast<double>(t[103]) / hits));
     }
     if (s.traced[104] != 0) {
@@ -2091,6 +2238,32 @@ void Report(const wchar_t* reason) {
                     100.0 * static_cast<double>(t[29]) / lit, 100.0 * static_cast<double>(t[27]) / lit,
                     100.0 * static_cast<double>(t[28]) / lit, 100.0 * static_cast<double>(t[52]) / lit,
                     100.0 * static_cast<double>(t[54]) / lit));
+        // emissive_lights.hlsl 112-115: emissive parts beyond the light grid's reach; the farthest, left out to
+        // fit the list, their triangles; the frames that left some out.
+        Info(Format(L"emissive parts left out per frame: %.0f beyond the light grid's reach, %.0f of the farthest "
+                    L"(%.0f triangles) to fit the list, on %.1f %% of the frames.",
+                    static_cast<double>(t[112]) / frames, static_cast<double>(t[113]) / frames,
+                    static_cast<double>(t[114]) / frames, 100.0 * static_cast<double>(t[115]) / frames));
+        // emissive_lights.hlsl 116-119 (the light tree: leaves past its sort, the trees built, their leaves; the
+        // grid's coarse cells filled from it) and primary_view.hlsl 120-121 (candidates from the coarse cells, of
+        // them those drawn from the tree itself: their cell not filled).
+        if (t[117] != 0) {
+            const double trees = static_cast<double>(t[117]);
+            Info(Format(L"light tree: %.0f leaves per frame (%.0f left out past its sort); %.0f coarse cells of the "
+                        L"light grid filled from it per frame; %.2f candidates per lit pixel from those levels, "
+                        L"%.2f %% of them drawn from the tree itself (their cell not filled).",
+                        static_cast<double>(t[118]) / trees, static_cast<double>(t[116]) / trees,
+                        static_cast<double>(t[119]) / trees, static_cast<double>(t[120]) / lit,
+                        t[120] != 0 ? 100.0 * static_cast<double>(t[121]) / static_cast<double>(t[120]) : 0.0));
+        }
+        // The light list's phases (GPU timestamps within BuildLights).
+        if (s.lightPhaseFrames != 0) {
+            const double phases = static_cast<double>(s.lightPhaseFrames);
+            Info(Format(L"light list phases (GPU ms per lit frame): the list and its cells' lists %.3f, the light "
+                        L"tree %.3f, its coarse cells %.3f, the light grid's slots %.3f.",
+                        s.lightPhaseMs[0] / phases, s.lightPhaseMs[1] / phases, s.lightPhaseMs[2] / phases,
+                        s.lightPhaseMs[3] / phases));
+        }
         // primary_view.hlsl 77-80: lit pixels whose diffuse bounce, specular bounce sampled a light at its hit,
         // unshadowed; 82: whose diffuse bounce brought 40 times the average of its wave's others.
         Info(Format(L"light at the bounces: a light sample at the diffuse bounce's hit on %.1f %% of the lit pixels, "
@@ -2227,8 +2400,9 @@ int Gate() {
     if (requested >= 0) {
         Report(L"before the mode switch");
         g.gateMode.store(requested);
-        Info(Format(L"gate mode is now %s (debug view %s%s).", ModeName(requested), ViewName(g.debugView.load()),
-                    g.decalLights.load() ? L"" : L"; glowing decals only glow"));
+        Info(Format(L"gate mode is now %s (debug view %s%s%s).", ModeName(requested), ViewName(g.debugView.load()),
+                    g.decalLights.load() ? L"" : L"; glowing decals only glow",
+                    g.lightTree.load() ? L"; light tree" : L""));
     }
     double frameMs = 0.0;
     if (g.lastFrame.QuadPart != 0) {
@@ -2390,6 +2564,10 @@ int Initialize(ID3D11Device* gameDevice, const Options& options) {
     Info(options.decalLights ? L"glowing decals light their surroundings."
                              : L"glowing decals only glow (DecalLights = false).");
     g.decalLights.store(options.decalLights);
+    Info(options.lightTree ? L"lamps and emitters traced at any distance: the light grid's coarse levels, filled "
+                             L"from the light tree (LightTree = true)."
+                           : L"lamps and emitters traced 32 m around the camera (the light grid's fine level).");
+    g.lightTree.store(options.lightTree);
     Info(Format(L"light multipliers: lamps %.2f (LampIntensity), the light emissive surfaces cast %.2f "
                 L"(EmissiveIntensity).", options.lampIntensity, options.emissiveIntensity));
     g.gateMode.store(static_cast<int>(options.gateMode));
@@ -2507,8 +2685,8 @@ int Initialize(ID3D11Device* gameDevice, const Options& options) {
             return 11;
         }
     }
-    // The lamp passes' scale: the LampIntensity setting, and 1 for "the traced light is on" (unbound: zeros).
-    const float lampScale[2] = {g.options.lampIntensity, 1.0f};
+    // The lamp passes' scale: the LampIntensity setting, and "the traced light is on": 1 with the light grid (the
+    // lamps traced inside it), 2 with the light tree (everywhere); unbound: zeros (ShaderPatch.cs RtLampShare).
     D3D11_TEXTURE2D_DESC scaleDesc{};
     scaleDesc.Width = 1;
     scaleDesc.Height = 1;
@@ -2518,12 +2696,16 @@ int Initialize(ID3D11Device* gameDevice, const Options& options) {
     scaleDesc.SampleDesc.Count = 1;
     scaleDesc.Usage = D3D11_USAGE_IMMUTABLE;
     scaleDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    const D3D11_SUBRESOURCE_DATA scaleData{lampScale, sizeof(lampScale), 0};
-    ComPtr<ID3D11Texture2D> scaleTexture;
-    if (FAILED(hr = d.d3d11->CreateTexture2D(&scaleDesc, &scaleData, &scaleTexture)) ||
-        FAILED(hr = d.d3d11->CreateShaderResourceView(scaleTexture.Get(), nullptr, &g.lampScale))) {
-        Error(Format(L"the lamp passes' scale could not be created (0x%08lX).", Hr(hr)));
-        return 12;
+    for (int treeScale = 0; treeScale < 2; ++treeScale) {
+        const float lampScale[2] = {g.options.lampIntensity, treeScale != 0 ? 2.0f : 1.0f};
+        const D3D11_SUBRESOURCE_DATA scaleData{lampScale, sizeof(lampScale), 0};
+        ComPtr<ID3D11Texture2D> scaleTexture;
+        if (FAILED(hr = d.d3d11->CreateTexture2D(&scaleDesc, &scaleData, &scaleTexture)) ||
+            FAILED(hr = d.d3d11->CreateShaderResourceView(scaleTexture.Get(), nullptr,
+                                                          treeScale != 0 ? &g.lampScaleTree : &g.lampScale))) {
+            Error(Format(L"the lamp passes' scale could not be created (0x%08lX).", Hr(hr)));
+            return 12;
+        }
     }
 
     if (!options.tracePath.empty()) {
@@ -2605,7 +2787,8 @@ void BindLighting(ID3D11DeviceContext* context) {
     // The overlay and the lamp passes' scale; while they are unbound (the gate off) the patched passes give the
     // game's own light.
     AcquireSRWLockShared(&g.targetLock);
-    ID3D11ShaderResourceView* srvs[] = {g.overlay.srv11.Get(), g.lampScale.Get()};
+    ID3D11ShaderResourceView* srvs[] = {g.overlay.srv11.Get(),
+                                        (g.lightTree.load() ? g.lampScaleTree : g.lampScale).Get()};
     ReleaseSRWLockShared(&g.targetLock);
     if (srvs[0] != nullptr) {
         context->PSSetShaderResources(kOverlaySlot, srvs[1] != nullptr ? 2 : 1, srvs);
@@ -2664,6 +2847,11 @@ void SetDebugView(const DebugView view) {
 
 void SetDecalLights(const bool on) {
     g.decalLights.store(on);
+    g.requestedMode.store(g.gateMode.load());  // starts a fresh statistics window
+}
+
+void SetLightTree(const bool on) {
+    g.lightTree.store(on);
     g.requestedMode.store(g.gateMode.load());  // starts a fresh statistics window
 }
 

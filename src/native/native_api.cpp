@@ -79,6 +79,7 @@ int __cdecl RtInitialize(void* d3d11Device, const RtOptions* options) {
         parsed.lampIntensity = options->lampIntensity;
         parsed.emissiveIntensity = options->emissiveIntensity;
         parsed.decalLights = options->decalLights != 0;
+        parsed.lightTree = options->lightTree != 0;
         parsed.tracePath = options->tracePath != nullptr ? options->tracePath : L"";
         return rt::Initialize(static_cast<ID3D11Device*>(d3d11Device), parsed);
     } catch (...) {
@@ -257,6 +258,10 @@ void __cdecl RtSetDecalLights(const int on) {
     rt::SetDecalLights(on != 0);
 }
 
+void __cdecl RtSetLightTree(const int on) {
+    rt::SetLightTree(on != 0);
+}
+
 const NativeApi g_api{
     sizeof(NativeApi),
     SE_RTHWACCEL_API_VERSION,
@@ -288,6 +293,7 @@ const NativeApi g_api{
     &RtSkinsSubmit,
     &RtDecalsSubmit,
     &RtSetDecalLights,
+    &RtSetLightTree,
 };
 
 } // namespace

@@ -31,6 +31,9 @@ namespace SpaceEngineers.RTHWAccel
         // Glowing decals (indicator lights, signs on blocks) light their surroundings (else they only glow, as in
         // the game).
         public bool DecalLights = true;
+        // Lamps and emitters traced at any distance (the light grid's coarse levels beyond its fine one, filled
+        // from the light tree), else 32 m around the camera, beyond which the game's own lamp light takes over.
+        public bool LightTree = true;
         // Multipliers of the lamps' light (traced, and the game's own beyond the traced area) and of the light
         // emissive surfaces cast (not their own glow); 1 = as the game sets them.
         public float LampIntensity = 1f;
@@ -82,6 +85,7 @@ namespace SpaceEngineers.RTHWAccel
             settings.Denoiser = ReadDenoiser(path, "RayTracing", "Denoiser", settings.Denoiser);
             settings.CharacterLights = ReadBool(path, "RayTracing", "CharacterLights", settings.CharacterLights);
             settings.DecalLights = ReadBool(path, "RayTracing", "DecalLights", settings.DecalLights);
+            settings.LightTree = ReadBool(path, "RayTracing", "LightTree", settings.LightTree);
             settings.LampIntensity = ReadIntensity(path, "LampIntensity", settings.LampIntensity);
             settings.EmissiveIntensity = ReadIntensity(path, "EmissiveIntensity", settings.EmissiveIntensity);
             settings.PatchShaders = ReadBool(path, "RayTracing", "PatchShaders", settings.PatchShaders);
@@ -106,7 +110,7 @@ namespace SpaceEngineers.RTHWAccel
 
         public override string ToString() =>
             $"GateMode={GateMode}, DebugView={DebugView}, Denoiser={Denoiser}, CharacterLights={CharacterLights}, " +
-            $"DecalLights={DecalLights}, " +
+            $"DecalLights={DecalLights}, LightTree={LightTree}, " +
             $"LampIntensity={LampIntensity.ToString(CultureInfo.InvariantCulture)}, " +
             $"EmissiveIntensity={EmissiveIntensity.ToString(CultureInfo.InvariantCulture)}, " +
             $"PatternStrength={PatternStrength.ToString(CultureInfo.InvariantCulture)}, " +

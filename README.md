@@ -56,17 +56,20 @@ rests on and the progress log are in the private
 - **Tracing.** Compute shaders with inline ray queries (DXR 1.1, shader
   model 6.5) trace jittered primary rays and the sun, sky, lamp and emissive
   light, plus one diffuse and one glossy bounce. A light grid around the
-  camera (2 m cells, each listing the strongest lights that reach it) feeds
-  the light sampling, and light samples are reused across frames and
-  between neighbouring pixels.
+  camera feeds the light sampling: 2 m cells out to 32 m, each listing the
+  strongest lights that reach it, and coarser cells beyond (8 m to 512 m,
+  out to 8 km), filled from a light tree (a bounding volume hierarchy over
+  every lamp and glowing surface, rebuilt each frame) only where the pixels
+  need them. Light samples are reused across frames and between
+  neighbouring pixels.
 - **Denoising.** DLSS Ray Reconstruction (NVIDIA RTX), or the plugin's own
   spatio-temporal filter.
 - **Composite.** At start the plugin applies a runtime patch to the game's
   `Lighting/LightDir.hlsl`. The patch works on a copy of the game's shader
   tree in `%LOCALAPPDATA%\SpaceEngineers.RTHWAccel`, which the plugin
   compiles and the game then reloads. The patched pass reads the traced
-  light in place of the game's sun, ambient and emissive light. The game's
-  own lamp passes keep lighting what lies beyond the light grid.
+  light in place of the game's sun, ambient and emissive light, and the
+  game's own lamp passes skip what the traced lamps light.
 
 ## Build
 

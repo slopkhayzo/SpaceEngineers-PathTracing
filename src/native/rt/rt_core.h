@@ -66,6 +66,7 @@ struct Options {
     float lampIntensity = 1.0f;   // the lamps' light: traced (scene.cpp UploadLamps), the game's beyond the traced area
     float emissiveIntensity = 1.0f;  // the light emissive surfaces cast (lights.hlsli Emission), not their own glow
     bool decalLights = true;  // glowing decals are lights (else they only glow; SetDecalLights changes it)
+    bool lightTree = false;   // lamps and emitters traced at any distance (the grid's coarse levels, the tree)
 };
 
 // Creates the D3D12 device on the adapter of the game's D3D11 device, the
@@ -96,6 +97,12 @@ void SetDebugView(DebugView view);
 // frame on (the DecalLights setting; the inspector's A/B); starts a fresh
 // statistics window.
 void SetDecalLights(bool on);
+// Any thread. Whether the lit views trace lamps and emitters at any distance
+// (the light grid's coarse levels beyond its fine one, filled from the light
+// tree; P2z) or within the fine level (32 m around the camera), from the next
+// frame on (the LightTree setting; the inspector's A/B); starts a fresh
+// statistics window.
+void SetLightTree(bool on);
 
 // Up to 8 probe pixels (x | y << 16): the material views log what their rays
 // found there (primary_view.hlsl) with each statistics window. 0 = none.

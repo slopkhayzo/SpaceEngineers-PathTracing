@@ -83,6 +83,8 @@ cbuffer Primary : register(b0)
     uint DecalCount;        // the frame's projected decals (primary_view.hlsl ApplyProjectedDecals); 0: none
     uint DecalLights;       // glowing decals light their surroundings (the DecalLights setting)
     uint OpenGeneration;    // primary_view.hlsl SeenThrough: the entries holding it count (from 1, now and then on)
+    uint LightTreeOn;       // 1: light candidates from the light tree (light_tree.hlsli), everywhere; 0: the grid
+    float DecalDepthBias;   // the game's decal depth bias, a share of the view depth (TraceClosestDecals)
 };
 
 // The game's own frame constants (MyCommon.FrameConstantsData), as its shaders read them.
@@ -128,6 +130,8 @@ static const uint kPartDecal = 8;
 static const uint kPartDecalPremultiplied = 16;
 // Cutout decals (also alpha-masked): solid for the camera's rays only (scene.h).
 static const uint kPartDecalCutout = 32;
+// Record flag: the record's mesh has decal parts (scene.h kRecordMeshDecals; TraceClosestDecals).
+static const uint kRecordMeshDecals = 1u << 17;
 
 bool IsDecal(GeometryRecord r) { return (r.Flags & kPartDecal) != 0; }
 
@@ -316,8 +320,9 @@ RayQuery<RAY_FLAG_NONE> TraceClosest(RayDesc ray, uint flags, uint mask, float c
 }
 
 // The blended decal a ray met on its way to its closest hit (TraceClosestDecals): the farthest one, which is the one
-// nearest the surface it stops at (the game's decals lie a few millimetres above their surfaces); `dropped` counts
-// the others. Its instance must be the hit's (a model's decals are parts of it): the caller uses the hit's transform.
+// nearest the surface it stops at (the game's decals lie on their surfaces or up to a few millimetres above them);
+// `dropped` counts the others. Its instance must be the hit's (a model's decals are parts of it): the caller uses the
+// hit's transform.
 struct DecalHits
 {
     uint count;          // 0 or 1
@@ -328,10 +333,40 @@ struct DecalHits
     uint primitive;
     float2 barycentrics;
     float t;
+    uint behind;         // 1: the hit is a cutout decal within the game's depth bias behind the closest surface
 };
 
+// A blended decal candidate of a TraceClosestDecals query: kept in `decals` if it is the farthest met so far (the
+// game draws single-sided decals from the front only).
+void KeepBlendedDecal(uint recordIndex, uint flags, bool frontFace, float t, uint geometryIndex, uint instanceIndex,
+                      uint primitive, float2 barycentrics, inout DecalHits decals)
+{
+    if (!frontFace && (flags & 2) == 0)
+        return;
+    if (decals.count != 0)
+    {
+        ++decals.dropped;
+        if (t <= decals.t)
+            return;  // the farther one stays
+    }
+    decals.count = 1;
+    decals.record = recordIndex;
+    decals.geometryIndex = geometryIndex;
+    decals.instanceIndex = instanceIndex;
+    decals.primitive = primitive;
+    decals.barycentrics = barycentrics;
+    decals.t = t;
+}
+
 // TraceClosest that also keeps the blended decals the ray met; which of them lie on the surface it stops at, the
-// caller decides (primary_view.hlsl ApplyDecals).
+// caller decides (primary_view.hlsl ApplyDecals). The camera's rays only.
+// The game draws its decals, cutout and blended, a little nearer than they lie (clip z + 0.0001 under its reversed
+// depth, Geometry/Passes/GBuffer/VertexStage.hlsli), and many lie exactly on their surface once its half-float
+// positions rounded both alike (RedShip's inset bookshelf: its vent grille, keyhole and labels): the game shows them,
+// a ray meeting both at the same distance would take either. So where the ray stops on a mesh with decals
+// (kRecordMeshDecals), a second query of the non-opaque triangles alone looks from there to DecalDepthBias of the
+// distance behind (the ray's parameter is the view depth): a cutout decal there is the hit (the nearest solid one),
+// a blended one is kept as in the first.
 RayQuery<RAY_FLAG_NONE> TraceClosestDecals(RayDesc ray, uint flags, uint mask, float coneSpread, out DecalHits decals)
 {
     decals = (DecalHits)0;
@@ -345,23 +380,10 @@ RayQuery<RAY_FLAG_NONE> TraceClosestDecals(RayDesc ray, uint flags, uint mask, f
         GeometryRecord candidate = Records[recordIndex];
         if (IsDecal(candidate))
         {
-            // The game draws single-sided decals from the front only.
-            if (!query.CandidateTriangleFrontFace() && (candidate.Flags & 2) == 0)
-                continue;
-            float t = query.CandidateTriangleRayT();
-            if (decals.count != 0)
-            {
-                ++decals.dropped;
-                if (t <= decals.t)
-                    continue;  // the farther one stays
-            }
-            decals.count = 1;
-            decals.record = recordIndex;
-            decals.geometryIndex = query.CandidateGeometryIndex();
-            decals.instanceIndex = query.CandidateInstanceIndex();
-            decals.primitive = query.CandidatePrimitiveIndex();
-            decals.barycentrics = query.CandidateTriangleBarycentrics();
-            decals.t = t;
+            KeepBlendedDecal(recordIndex, candidate.Flags, query.CandidateTriangleFrontFace(),
+                             query.CandidateTriangleRayT(), query.CandidateGeometryIndex(),
+                             query.CandidateInstanceIndex(), query.CandidatePrimitiveIndex(),
+                             query.CandidateTriangleBarycentrics(), decals);
             continue;
         }
         if (AlphaSolid(query.CandidateInstanceIndex(), query.CandidateInstanceID(), query.CandidateGeometryIndex(),
@@ -370,6 +392,52 @@ RayQuery<RAY_FLAG_NONE> TraceClosestDecals(RayDesc ray, uint flags, uint mask, f
                        (mask & 0x01) != 0 && query.CandidateInstanceContributionToHitGroupIndex() != 0, true))
             query.CommitNonOpaqueTriangleHit();
     }
+    if (query.CommittedStatus() != COMMITTED_TRIANGLE_HIT || DecalDepthBias <= 0)
+        return query;
+    uint hitFlags = Records[query.CommittedInstanceID() + query.CommittedGeometryIndex()].Flags;
+    if ((hitFlags & kRecordMeshDecals) == 0 || (hitFlags & kPartDecalCutout) != 0)
+        return query;
+    RayDesc margin = ray;
+    margin.TMin = query.CommittedRayT() * (1 - 1e-6);
+    margin.TMax = query.CommittedRayT() * (1 + DecalDepthBias);
+    RayQuery<RAY_FLAG_CULL_OPAQUE> nearer;
+    nearer.TraceRayInline(Scene, flags, mask, margin);
+    while (nearer.Proceed())
+    {
+        uint recordIndex = nearer.CandidateInstanceID() + nearer.CandidateGeometryIndex();
+        GeometryRecord candidate = Records[recordIndex];
+        if (IsDecal(candidate))
+            KeepBlendedDecal(recordIndex, candidate.Flags, nearer.CandidateTriangleFrontFace(),
+                             nearer.CandidateTriangleRayT(), nearer.CandidateGeometryIndex(),
+                             nearer.CandidateInstanceIndex(), nearer.CandidatePrimitiveIndex(),
+                             nearer.CandidateTriangleBarycentrics(), decals);
+        else if ((candidate.Flags & kPartDecalCutout) != 0 &&
+                 AlphaSolid(nearer.CandidateInstanceIndex(), nearer.CandidateInstanceID(),
+                            nearer.CandidateGeometryIndex(), nearer.CandidatePrimitiveIndex(),
+                            nearer.CandidateTriangleBarycentrics(), coneSpread * nearer.CandidateTriangleRayT(),
+                            (mask & 0x01) != 0 && nearer.CandidateInstanceContributionToHitGroupIndex() != 0, true))
+            nearer.CommitNonOpaqueTriangleHit();
+    }
+    if (nearer.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
+        return query;
+    // The decal as the hit: the query again over the decal's distance alone (non-opaque triangles; the same ray
+    // meets the same triangles at the same distances), so that the caller reads it from the query it gets.
+    float decalT = nearer.CommittedRayT();
+    RayDesc at = ray;
+    at.TMin = decalT * (1 - 1e-5);
+    at.TMax = decalT * (1 + 1e-5);
+    query.TraceRayInline(Scene, flags | RAY_FLAG_CULL_OPAQUE, mask, at);
+    while (query.Proceed())
+    {
+        GeometryRecord candidate = Records[query.CandidateInstanceID() + query.CandidateGeometryIndex()];
+        if ((candidate.Flags & kPartDecalCutout) != 0 &&
+            AlphaSolid(query.CandidateInstanceIndex(), query.CandidateInstanceID(), query.CandidateGeometryIndex(),
+                       query.CandidatePrimitiveIndex(), query.CandidateTriangleBarycentrics(),
+                       coneSpread * query.CandidateTriangleRayT(),
+                       (mask & 0x01) != 0 && query.CandidateInstanceContributionToHitGroupIndex() != 0, true))
+            query.CommitNonOpaqueTriangleHit();
+    }
+    decals.behind = query.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 1 : 0;
     return query;
 }
 

@@ -7,8 +7,11 @@
 //     one's within its mask) and its mean emitted luminance; only when the
 //     material table changed
 //   1 reset: the counters, the key table and the cells' lists
-//   2 parts: per TLAS instance drawn in the main view, its parts whose
-//     material can emit, each with its range of the triangle list
+//   2 parts: per TLAS instance drawn in the main view within the grid's
+//     reach, its parts whose material can emit, counted by distance (First
+//     0), then (First 1, after pass 12) those of the nearest distance bins
+//     that fit listed, each with its range of the triangle list
+//   12 cutoff, between the two: the nearest bins that fit the capacities
 //   3 arguments: the triangle pass's dispatch (one group per part), the
 //     lamps' range after the triangles, whether the list is complete, the
 //     statistics
@@ -40,6 +43,23 @@
 //     behind them left out; lamps: the game's falloff from the cell's nearest
 //     point, spot lights whose cone misses the cell left out), the cell's
 //     reach widened for the points that draw from it (kLightCellReach)
+//   With the light tree (light_tree.hlsli), after pass 7 and before pass 8:
+//   13 tree leaves: per leaf (the listed parts, then the lamps), its record
+//     and its centre in the bounds of the leaves' centres
+//   14 tree keys: per slot of the sort (Count: its size, a power of two), the
+//     leaf's Morton code in those bounds (15 bits per axis) and the leaf
+//   15, 16 and 17: the bitonic sort of the keys: chunks of kTreeSortChunk in
+//     shared memory (15), then per stage (Count) its steps (First) wider than a
+//     chunk (16) and the narrower ones in shared memory (17)
+//   18 tree nodes: per internal node, its range of the sorted leaves and its
+//     split (Karras 2012), its two children and their parents
+//   19 tree slots: per leaf, up its parents: the second child to arrive fills
+//     its node's slots from both children and goes on
+//   20 level cells: per cell of the grid's coarse levels, whether to fill it
+//     (a point's candidate came from it in the latest frames): listed
+//   21 level slots: per listed cell and slot, one light resampled from
+//     candidates drawn from the tree for the cell's points (a thread each), by
+//     its strength at the cell (CellTarget, as pass 8's)
 //
 // The weight of an entry in the prefix sums (LightWeight) is its power over its
 // squared distance from the camera (at least 1 m^2): a triangle's power is its
@@ -48,6 +68,13 @@
 
 #include "scene_common.hlsli"
 #include "lights.hlsli"
+// The light tree (u27; light_tree.hlsli): coherent across the groups of a pass, which fills the nodes from
+// the leaves up through each other's writes (TreeSlotsPass). Its walks (LevelSlotsPass) read the nodes of the
+// passes before through a plain view of the same buffer (u28), which the caches keep.
+globallycoherent RWByteAddressBuffer LightTree : register(u27);
+RWByteAddressBuffer LightTreeCached : register(u28);
+#define LIGHT_TREE_WALK LightTreeCached
+#include "light_tree.hlsli"
 
 #define GROUP_SIZE 256
 
@@ -61,7 +88,9 @@ cbuffer LightBuild : register(b2)
     uint Pass;
     uint Count;  // pass 0: materials; pass 2: TLAS instances; passes 3, 4, 5 and 10: lamps
     uint First;  // pass 0: the first material of this dispatch; passes 9 and 10: 0 counts, 1 lists (ListNear)
-    uint GridByPower;  // pass 8: 1 for P2p's grid (lights drawn by power alone; the emitters-power-grid view)
+    // Pass 8: 1 for P2p's grid (lights drawn by power alone; the emitters-power-grid view); pass 2: 1 when the
+    // light tree samples (no part is beyond its reach).
+    uint Option;
 };
 
 static const uint kGridCandidates = 8;
@@ -138,7 +167,7 @@ void MaterialPass(uint material, uint thread)
 // The counters, the key table's tags, the cells' lists' counters and bins (one thread per slot).
 void ResetPass(uint slot)
 {
-    if (slot < 16)
+    if (slot < kLightCounterWords)
         LightCounters.Store(slot * 4, 0);
     if (slot < kLightKeySlots)
         LightKeys[slot].x = 0;
@@ -217,28 +246,479 @@ void ThresholdPass(uint cell)
         threshold | (above << kLightBinBits) | (min(reaching, 0x1FFFFFu) << (kLightBinBits + 6));
 }
 
+// Pass 2, per TLAS instance drawn in the main view: its parts whose material can emit, unless the instance
+// lies beyond the grid's reach (kLightPartReach; statistic 112; the light tree has none: Option 1). Counting
+// (First 0) adds them to their distance bin; listing (First 1, after CutoffPass) appends those of the bins that
+// fit, each with its range of the triangle list.
 void PartsPass(uint instance)
 {
-    if (instance >= Count)
-        return;
-    uint2 ids = InstanceDescs.Load2(instance * 64 + 48);  // InstanceID | InstanceMask << 24, ... | Flags << 24
-    if (((ids.x >> 24) & 0x01) == 0)
-        return;  // not drawn in the main view
-    uint first = ids.x & 0xFFFFFF;
-    uint records = Records[first].Counts >> 24;
-    for (uint p = 0; p < records; ++p)
+    uint beyond = 0;
+    uint2 ids = 0;
+    if (instance < Count)
+        ids = InstanceDescs.Load2(instance * 64 + 48);  // InstanceID | InstanceMask << 24, ... | Flags << 24
+    if (((ids.x >> 24) & 0x01) != 0)  // drawn in the main view
     {
-        GeometryRecord record = Records[first + p];
-        uint triangles = record.Counts & 0xFFFFFF;
-        if (triangles == 0 || Kind(record) == 2 || record.AttributeOffset == kNoAttributes ||
-            MaterialLight[record.Material].x <= 0 || GlowsOnly(record))
+        // The instance's origin, camera-relative (the transform's last column).
+        float3 origin = asfloat(uint3(InstanceDescs.Load(instance * 64 + 12), InstanceDescs.Load(instance * 64 + 28),
+                                      InstanceDescs.Load(instance * 64 + 44)));
+        float outside = length(max(abs(origin) - 0.5 * kLightGridSize * kLightCellSize, 0));
+        uint bin = min((uint)(length(origin) / kLightBinMeters), kLightDistanceBins - 1);
+        uint cutoff = First != 0 ? LightCounters.Load(kLightCutoff * 4) : kLightDistanceBins;
+        uint first = ids.x & 0xFFFFFF;
+        uint records = Records[first].Counts >> 24;
+        for (uint p = 0; p < records; ++p)
+        {
+            GeometryRecord record = Records[first + p];
+            uint triangles = record.Counts & 0xFFFFFF;
+            if (triangles == 0 || Kind(record) == 2 || record.AttributeOffset == kNoAttributes ||
+                MaterialLight[record.Material].x <= 0 || GlowsOnly(record))
+                continue;
+            if (outside > kLightPartReach && Option == 0)
+            {
+                beyond += First == 0 ? 1 : 0;
+                continue;
+            }
+            if (First == 0)
+            {
+                LightCounters.InterlockedAdd((kLightBins + 2 * bin) * 4, 1);
+                LightCounters.InterlockedAdd((kLightBins + 2 * bin + 1) * 4, triangles);
+                continue;
+            }
+            if (bin >= cutoff)
+                continue;
+            uint slot;
+            LightCounters.InterlockedAdd(kLightCountParts * 4, 1, slot);
+            uint start;
+            LightCounters.InterlockedAdd(kLightCountTriangles * 4, triangles, start);
+            if (slot < kMaxLightParts)
+                LightParts[slot] = uint4(instance, first + p, triangles | (p << 24), start);
+        }
+    }
+    uint waveBeyond = WaveActiveSum(beyond);
+    if (WaveIsFirstLane() && waveBeyond != 0)
+        Stats.InterlockedAdd(112 * 4, waveBeyond);
+}
+
+// Pass 12 (one thread, between PartsPass's counting and listing): the first distance bin left out of the list,
+// the nearest bins listed as long as their parts and triangles fit, room kept for the lamps (Count), which
+// follow the triangles; statistics 113-115: the parts and triangles left out to fit, the frames that did.
+void CutoffPass(uint thread)
+{
+    if (thread != 0)
+        return;
+    uint parts = 0;
+    uint entries = Count;
+    uint cutoff = kLightDistanceBins;
+    uint2 left = 0;
+    for (uint b = 0; b < kLightDistanceBins; ++b)
+    {
+        uint2 n = LightCounters.Load2((kLightBins + 2 * b) * 4);
+        if (cutoff == kLightDistanceBins && (parts + n.x > kMaxLightParts || entries + n.y > kMaxLightTriangles))
+            cutoff = b;
+        if (cutoff != kLightDistanceBins)
+        {
+            left += n;
             continue;
-        uint slot;
-        LightCounters.InterlockedAdd(kLightCountParts * 4, 1, slot);
-        uint start;
-        LightCounters.InterlockedAdd(kLightCountTriangles * 4, triangles, start);
-        if (slot < kMaxLightParts)
-            LightParts[slot] = uint4(instance, first + p, triangles | (p << 24), start);
+        }
+        parts += n.x;
+        entries += n.y;
+    }
+    LightCounters.Store(kLightCutoff * 4, cutoff);
+    Stats.InterlockedAdd(113 * 4, left.x);
+    Stats.InterlockedAdd(114 * 4, left.y);
+    Stats.InterlockedAdd(115 * 4, left.x != 0 ? 1u : 0u);
+}
+
+// A listed light's strength at a light-grid cell (`centre`; `reach`: the points its slots serve), the target its
+// slots resample by (GridPass, LevelSlotsPass): a lamp's (its place in Lamps: `lampIndex`) game falloff from the
+// nearest point the cell serves (0 where a spot light's cone misses it); a triangle's power over the squared
+// distance from its centre to the cell's (at least the cell's half diagonal's square), 0 for a one-sided one with
+// the whole cell and the points it serves behind it.
+float CellTarget(LightTriangle light, uint lampIndex, float3 centre, float reach, float halfDiagonal2)
+{
+    if (IsLamp(light))
+        return LampCellStrength(Lamps[lampIndex], centre, reach);
+    float3 lightCentre = light.corner.xyz + (light.edge1.xyz + light.edge2.xyz) / 3;
+    float3 toCell = centre - lightCentre;
+    if ((asuint(light.uv2.z) & kLightTwoSided) == 0 && dot(LightNormal(light), toCell) < -reach)
+        return 0;
+    return TrianglePower(light) / max(dot(toCell, toCell), halfDiagonal2);
+}
+
+// --- The light tree (light_tree.hlsli) --------------------------------------------------------------------
+
+groupshared uint2 gsSort[kTreeSortChunk];
+
+// A leaf's record (light_tree.hlsli's layout): a part's bounds and power (its LightParts bounds), a lamp's
+// position (within kLampRadius), intensity, range and falloff.
+void TreeLeafRecord(uint leaf, uint parts, out float4 r0, out float4 r1, out uint4 r2)
+{
+    if (leaf < parts)
+    {
+        float4 low = asfloat(LightParts[kLightPartBounds + 2 * leaf]);
+        float4 high = asfloat(LightParts[kLightPartBounds + 2 * leaf + 1]);
+        r0 = float4(low.xyz, max(low.w, 0));
+        r1 = float4(high.xyz, 0);
+        r2 = uint4(0u, asuint(kTreeNoFalloff), kTreeLeaf | leaf, 0u);
+        return;
+    }
+    Lamp lamp = Lamps[leaf - parts];
+    r0 = float4(lamp.position - kLampRadius, 0);
+    r1 = float4(lamp.position + kLampRadius, max(Luminance(lamp.color) * lamp.diffuseFactor, 0));
+    r2 = uint4(asuint(max(lamp.range, 0.0f)), asuint(max(lamp.falloff, 0.0f)), kTreeLeaf | leaf, 0u);
+}
+
+// Pass 13, per leaf (the listed parts, then the lamps: Count): its record, and its centre into the bounds of the
+// leaves' centres (the low corner as the largest complement; one atomic per wave and word); the leaves counted.
+void TreeLeavesPass(uint leaf)
+{
+    uint parts = min(LightCounters.Load(kLightCountParts * 4), kMaxLightParts);
+    uint leaves = min(parts + Count, kTreeMaxLeaves);
+    if (leaf == 0)
+        LightCounters.Store(kLightTreeLeaves * 4, leaves);
+    uint3 low = 0;
+    uint3 high = 0;
+    if (leaf < leaves)
+    {
+        float4 r0, r1;
+        uint4 r2;
+        TreeLeafRecord(leaf, parts, r0, r1, r2);
+        uint base = kTreeLeaves + leaf * 48;
+        LightTree.Store4(base, asuint(r0));
+        LightTree.Store4(base + 16, asuint(r1));
+        LightTree.Store4(base + 32, r2);
+        float3 centre = 0.5 * (r0.xyz + r1.xyz);
+        high = uint3(OrderedFloat(centre.x), OrderedFloat(centre.y), OrderedFloat(centre.z));
+        low = ~high;
+    }
+    low = WaveActiveMax(low);
+    high = WaveActiveMax(high);
+    if (WaveIsFirstLane() && high.x != 0)
+    {
+        LightCounters.InterlockedMax(kLightTreeLow * 4, low.x);
+        LightCounters.InterlockedMax((kLightTreeLow + 1) * 4, low.y);
+        LightCounters.InterlockedMax((kLightTreeLow + 2) * 4, low.z);
+        LightCounters.InterlockedMax(kLightTreeHigh * 4, high.x);
+        LightCounters.InterlockedMax((kLightTreeHigh + 1) * 4, high.y);
+        LightCounters.InterlockedMax((kLightTreeHigh + 2) * 4, high.z);
+    }
+}
+
+// Pass 14, per slot of the sort (Count: its size, a power of two): the leaf's key (TreeKey: its centre's Morton
+// code in the bounds of the leaves' centres, then the leaf); past the leaves none (sorted last). The leaves the
+// sort takes (kLightTreeSorted); statistics 116-118: those it cannot (past its size), the trees built, their
+// leaves.
+void TreeKeysPass(uint slot)
+{
+    if (slot >= Count)
+        return;
+    uint leaves = LightCounters.Load(kLightTreeLeaves * 4);
+    if (slot == 0)
+    {
+        LightCounters.Store(kLightTreeSorted * 4, min(leaves, Count));
+        Stats.InterlockedAdd(116 * 4, leaves > Count ? leaves - Count : 0);
+        Stats.InterlockedAdd(117 * 4, 1u);
+        Stats.InterlockedAdd(118 * 4, min(leaves, Count));
+    }
+    uint2 key = uint2(0xFFFFFFFF, kTreeNone);
+    if (slot < leaves)
+    {
+        uint3 lowBits = LightCounters.Load3(kLightTreeLow * 4);
+        uint3 highBits = LightCounters.Load3(kLightTreeHigh * 4);
+        float3 low = float3(FromOrderedFloat(~lowBits.x), FromOrderedFloat(~lowBits.y), FromOrderedFloat(~lowBits.z));
+        float3 high = float3(FromOrderedFloat(highBits.x), FromOrderedFloat(highBits.y), FromOrderedFloat(highBits.z));
+        uint base = kTreeLeaves + slot * 48;
+        float3 centre = 0.5 * (asfloat(LightTree.Load3(base)) + asfloat(LightTree.Load3(base + 16)));
+        key = TreeKey((centre - low) / max(high - low, 1e-6), slot);
+    }
+    LightTree.Store2(kTreeKeys + slot * 8, key);
+}
+
+// Whether key a sorts after key b (x, then y).
+bool KeyAfter(uint2 a, uint2 b)
+{
+    return a.x > b.x || (a.x == b.x && a.y > b.y);
+}
+
+// The steps of a bitonic stage from `firstStep` down, on the group's chunk in shared memory (its keys from
+// `chunkBase` on), each pair ascending or descending as its place in the whole network has it.
+void SortChunkSteps(uint chunkBase, uint thread, uint stage, uint firstStep)
+{
+    for (uint step = firstStep; step > 0; step >>= 1)
+    {
+        for (uint pair = thread; pair < kTreeSortChunk / 2; pair += GROUP_SIZE)
+        {
+            uint i = 2 * step * (pair / step) + pair % step;
+            uint l = i + step;
+            bool ascending = ((chunkBase + i) & stage) == 0;
+            uint2 a = gsSort[i];
+            uint2 b = gsSort[l];
+            if (KeyAfter(a, b) == ascending)
+            {
+                gsSort[i] = b;
+                gsSort[l] = a;
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+}
+
+// Passes 15 (the stages up to a chunk) and 17 (Count: a wider stage's steps narrower than a chunk), per chunk of
+// the sort (a group): its keys sorted in shared memory.
+void TreeSortChunkPass(uint group, uint thread, bool first)
+{
+    uint chunkBase = group * kTreeSortChunk;
+    for (uint k = thread; k < kTreeSortChunk; k += GROUP_SIZE)
+        gsSort[k] = LightTree.Load2(kTreeKeys + (chunkBase + k) * 8);
+    GroupMemoryBarrierWithGroupSync();
+    if (first)
+    {
+        for (uint stage = 2; stage <= kTreeSortChunk; stage <<= 1)
+            SortChunkSteps(chunkBase, thread, stage, stage >> 1);
+    }
+    else
+    {
+        SortChunkSteps(chunkBase, thread, Count, kTreeSortChunk / 2);
+    }
+    for (uint k2 = thread; k2 < kTreeSortChunk; k2 += GROUP_SIZE)
+        LightTree.Store2(kTreeKeys + (chunkBase + k2) * 8, gsSort[k2]);
+}
+
+// Pass 16, per pair (Count: the stage, First: the step, a chunk or wider): one compare-exchange in place.
+void TreeSortGlobalPass(uint pair)
+{
+    uint i = 2 * First * (pair / First) + pair % First;
+    uint l = i + First;
+    bool ascending = (i & Count) == 0;
+    uint2 a = LightTree.Load2(kTreeKeys + i * 8);
+    uint2 b = LightTree.Load2(kTreeKeys + l * 8);
+    if (KeyAfter(a, b) == ascending)
+    {
+        LightTree.Store2(kTreeKeys + i * 8, b);
+        LightTree.Store2(kTreeKeys + l * 8, a);
+    }
+}
+
+// The length of the common prefix of the sorted keys at places i and j as 64-bit numbers (x above y; the keys
+// differ: the leaf is in them), -1 outside the n leaves (Karras 2012's delta).
+int TreePrefix(int i, int j, int n)
+{
+    if (j < 0 || j >= n)
+        return -1;
+    uint2 a = LightTree.Load2(kTreeKeys + (uint)i * 8);
+    uint2 b = LightTree.Load2(kTreeKeys + (uint)j * 8);
+    if (a.x != b.x)
+        return 31 - (int)firstbithigh(a.x ^ b.x);
+    return 63 - (int)firstbithigh(a.y ^ b.y);
+}
+
+// Pass 18, per internal node (n - 1 of them for n leaves; node 0 the root): its range of the sorted leaves and its
+// split (Karras 2012), its children (into its slots' child words; pass 19 fills the rest) and their parents; its
+// visit counter cleared. The tree's root (kLightTreeRoot): node 0, the one leaf, or none.
+void TreeNodesPass(uint node)
+{
+    int n = (int)TreeLeafCount();
+    if (node == 0)
+    {
+        uint only = kTreeLeaf | (LightTree.Load(kTreeKeys + 4) & kTreeLeafMask);
+        LightCounters.Store(kLightTreeRoot * 4, n == 0 ? kTreeNone : n == 1 ? only : 0u);
+        LightTree.Store(kTreeNodeParents, kTreeNone);
+    }
+    if (n < 2 || (int)node >= n - 1)
+        return;
+    int i = (int)node;
+    int d = TreePrefix(i, i + 1, n) - TreePrefix(i, i - 1, n) >= 0 ? 1 : -1;
+    int minimum = TreePrefix(i, i - d, n);
+    int maximum = 2;
+    while (maximum < (1 << 20) && TreePrefix(i, i + maximum * d, n) > minimum)  // (bounded: the GPU must not hang)
+        maximum *= 2;
+    int length = 0;
+    for (int t = maximum / 2; t >= 1; t /= 2)
+    {
+        if (TreePrefix(i, i + (length + t) * d, n) > minimum)
+            length += t;
+    }
+    int j = i + length * d;
+    int prefix = TreePrefix(i, j, n);
+    int split = 0;
+    for (int divisor = 2; divisor <= (1 << 24); divisor *= 2)
+    {
+        int t = (length + divisor - 1) / divisor;
+        if (TreePrefix(i, i + (split + t) * d, n) > prefix)
+            split += t;
+        if (t <= 1)
+            break;
+    }
+    int gamma = i + split * d + min(d, 0);
+    uint leftLeaf = kTreeLeaf | (LightTree.Load(kTreeKeys + (uint)gamma * 8 + 4) & kTreeLeafMask);
+    uint rightLeaf = kTreeLeaf | (LightTree.Load(kTreeKeys + (uint)(gamma + 1) * 8 + 4) & kTreeLeafMask);
+    uint left = min(i, j) == gamma ? leftLeaf : (uint)gamma;
+    uint right = max(i, j) == gamma + 1 ? rightLeaf : (uint)(gamma + 1);
+    uint base = kTreeNodes + node * 96;
+    LightTree.Store(base + 40, left);
+    LightTree.Store(base + 88, right);
+    if ((left & kTreeLeaf) != 0)
+        LightTree.Store(kTreeLeafParents + (uint)gamma * 4, node);
+    else
+        LightTree.Store(kTreeNodeParents + left * 4, node);
+    if ((right & kTreeLeaf) != 0)
+        LightTree.Store(kTreeLeafParents + (uint)(gamma + 1) * 4, node);
+    else
+        LightTree.Store(kTreeNodeParents + right * 4, node);
+    LightTree.Store(kTreeVisits + node * 4, 0);
+}
+
+// A child's record: a leaf's, or a node's two slots merged (bounds joined, powers and intensities summed, the
+// largest range, the smallest falloff), with the child in its child word.
+void TreeChildRecord(uint child, out float4 r0, out float4 r1, out uint4 r2)
+{
+    if ((child & kTreeLeaf) != 0)
+    {
+        uint leafBase = kTreeLeaves + (child & ~kTreeLeaf) * 48;
+        r0 = asfloat(LightTree.Load4(leafBase));
+        r1 = asfloat(LightTree.Load4(leafBase + 16));
+        r2 = LightTree.Load4(leafBase + 32);
+        r2.z = child;
+        return;
+    }
+    uint base = kTreeNodes + child * 96;
+    float4 a0 = asfloat(LightTree.Load4(base));
+    float4 a1 = asfloat(LightTree.Load4(base + 16));
+    uint4 a2 = LightTree.Load4(base + 32);
+    float4 b0 = asfloat(LightTree.Load4(base + 48));
+    float4 b1 = asfloat(LightTree.Load4(base + 64));
+    uint4 b2 = LightTree.Load4(base + 80);
+    r0 = float4(min(a0.xyz, b0.xyz), a0.w + b0.w);
+    r1 = float4(max(a1.xyz, b1.xyz), a1.w + b1.w);
+    r2 = uint4(asuint(max(asfloat(a2.x), asfloat(b2.x))), asuint(min(asfloat(a2.y), asfloat(b2.y))), child, 0);
+}
+
+// Pass 19, per leaf by its sorted place: up its parents, the second child to arrive at a node fills the node's
+// slots from both children and goes on to its parent; the first stops there.
+void TreeSlotsPass(uint place)
+{
+    uint n = TreeLeafCount();
+    if (n < 2 || place >= n)
+        return;
+    uint node = LightTree.Load(kTreeLeafParents + place * 4);
+    [loop]
+    for (uint guard = 0; guard < 128 && node != kTreeNone; ++guard)
+    {
+        uint previous;
+        LightTree.InterlockedAdd(kTreeVisits + node * 4, 1, previous);
+        if (previous == 0)
+            return;
+        DeviceMemoryBarrier();
+        uint base = kTreeNodes + node * 96;
+        for (uint side = 0; side < 2; ++side)
+        {
+            uint slot = base + side * 48;
+            float4 r0, r1;
+            uint4 r2;
+            TreeChildRecord(LightTree.Load(slot + 40), r0, r1, r2);
+            LightTree.Store4(slot, asuint(r0));
+            LightTree.Store4(slot + 16, asuint(r1));
+            LightTree.Store4(slot + 32, r2);
+        }
+        DeviceMemoryBarrier();
+        node = LightTree.Load(kTreeNodeParents + node * 4);
+    }
+}
+
+// Pass 20, per coarse cell of the light grid (light_tree.hlsli): filled this frame where a point's candidate came
+// from it in the latest kLevelUseFrames frames: its fill mark (what the points check) and its place in the list
+// of the cells to fill (pass 21); statistic 119: the cells filled.
+void LevelCellsPass(uint levelCell)
+{
+    bool fill = false;
+    if (levelCell < kLightLevelCells && LightsActive())
+    {
+        uint used = LightTree.Load(kTreeLevelUsed + levelCell * 4);
+        fill = Frame - used <= kLevelUseFrames;  // (unsigned: none from before a reset of the frames)
+    }
+    uint filled = WaveActiveCountBits(fill);
+    uint first = 0;
+    if (WaveIsFirstLane() && filled != 0)
+    {
+        LightCounters.InterlockedAdd(kLightLevelFill * 4, filled, first);
+        Stats.InterlockedAdd(119 * 4, filled);
+    }
+    first = WaveReadLaneFirst(first);
+    if (fill)
+    {
+        LightTree.Store(kTreeLevelList + (first + WavePrefixCountBits(fill)) * 4, levelCell);
+        LightTree.Store(kTreeLevelFilled + levelCell * 4, Frame);
+    }
+}
+
+// Pass 21 (kLevelSlotGroups groups, each taking the batches of kLevelBatchSlots slots that far apart): per coarse
+// cell to fill (pass 20's list) and slot, one light resampled from kLevelCandidates candidates drawn from the light
+// tree for the cell's points (TreeLight: any facing, within the cell's reach; a thread per candidate, their walks
+// side by side) by its strength at the cell (CellTarget, as the fine level's slots).
+static const uint kLevelCandidates = 8;
+static const uint kLevelBatchSlots = GROUP_SIZE / kLevelCandidates;
+static const uint kLevelSlotGroups = 512;  // rt_core.cpp kLevelSlotGroups
+groupshared float gsLevelWeight[GROUP_SIZE];
+groupshared float gsLevelTarget[GROUP_SIZE];
+groupshared uint gsLevelLight[GROUP_SIZE];
+
+void LevelSlotsPass(uint group, uint thread)
+{
+    uint slots = min(LightCounters.Load(kLightLevelFill * 4), kLightLevelCells) * kLightSlots;
+    uint lampStart = LightCounters.Load(kLightLampStart * 4);
+    uint candidate = thread % kLevelCandidates;
+    for (uint batch = group * kLevelBatchSlots; batch < slots; batch += kLevelSlotGroups * kLevelBatchSlots)
+    {
+        uint item = batch + thread / kLevelCandidates;  // this thread's slot among those to fill
+        uint levelCell = 0;
+        uint index = kNoLight;
+        float target = 0;
+        float weight = 0;
+        if (item < slots)
+        {
+            levelCell = LightTree.Load(kTreeLevelList + (item / kLightSlots) * 4);
+            float3 centre = LevelCellCentre(levelCell);
+            float halfDiagonal = 0.8660254 * LevelCellSize(LevelOfCell(levelCell));
+            float reach = 2 * halfDiagonal;  // the cell's points and the jitter's (as the fine level's kLightCellReach)
+            uint seed = Pcg((item * kLevelCandidates + candidate) ^ Pcg(levelCell ^ Pcg(Frame * 0x9E3779B9u + 13)));
+            float probability;
+            if (TreeLight(centre, float3(0, 0, 0), reach, halfDiagonal * halfDiagonal, seed, index, probability))
+            {
+                LightTriangle light = Lights[index];
+                target = CellTarget(light, IsLamp(light) ? index - lampStart : 0, centre, reach,
+                                    halfDiagonal * halfDiagonal);
+                weight = target > 0 ? target / probability : 0;  // the target over the candidate's probability
+            }
+        }
+        gsLevelWeight[thread] = weight;
+        gsLevelTarget[thread] = target;
+        gsLevelLight[thread] = index;
+        GroupMemoryBarrierWithGroupSync();
+        if (candidate == 0 && item < slots)
+        {
+            // The slot's candidates resampled (streaming RIS, as GridPass).
+            uint seed = Pcg(item ^ Pcg(Frame * 0x9E3779B9u + 29));
+            uint chosen = kNoLight;
+            float chosenTarget = 0;
+            float weightSum = 0;
+            for (uint k = 0; k < kLevelCandidates; ++k)
+            {
+                float w = gsLevelWeight[thread + k];
+                if (!(w > 0))
+                    continue;
+                weightSum += w;
+                if (Random(seed) * weightSum < w)
+                {
+                    chosen = gsLevelLight[thread + k];
+                    chosenTarget = gsLevelTarget[thread + k];
+                }
+            }
+            uint slot = levelCell * kLightSlots + item % kLightSlots;
+            LightTree.Store2(kTreeLevelSlots + slot * 8,
+                             chosenTarget > 0 ? uint2(chosen, asuint(weightSum / (kLevelCandidates * chosenTarget)))
+                                              : uint2(kNoLight, 0));
+        }
+        GroupMemoryBarrierWithGroupSync();  // the shared arrays are the next batch's
     }
 }
 
@@ -663,9 +1143,9 @@ void GridPass(uint slot, uint thread)
     float nearSum = 0;
     for (uint n = 0; n < nearCount; ++n)
         nearSum += asfloat(gsNear[listBase + n].y);
-    float nearShare = nearSum > 0 && GridByPower == 0 ? kNearShare : 0;
+    float nearShare = nearSum > 0 && Option == 0 ? kNearShare : 0;
     // What the cell's slots serve: the points of the cell, and (LightCandidates' jitter) as far again.
-    float reach = GridByPower == 0 ? kLightCellReach : kLightCellHalfDiagonal;
+    float reach = Option == 0 ? kLightCellReach : kLightCellHalfDiagonal;
     uint count = LightCount();
     float total = LightTotalPower();
     float3 centre = CellCentre(CellCoordinates(cell));
@@ -752,22 +1232,7 @@ void GridPass(uint slot, uint thread)
         float probability = nearShare * nearProbability + (1 - nearShare) * weight / total;
         if (!(probability > 0))
             continue;
-        float target;
-        if (lamp)
-        {
-            // The game's falloff from the nearest point the cell serves; spot lights whose cone misses it: 0.
-            target = LampCellStrength(Lamps[lampIndex], centre, reach);
-        }
-        else
-        {
-            float3 lightCentre = light.corner.xyz + (light.edge1.xyz + light.edge2.xyz) / 3;
-            float3 toCell = centre - lightCentre;
-            // A one-sided triangle with the whole cell (and the points it serves) behind it lights nothing there.
-            if ((asuint(light.uv2.z) & kLightTwoSided) == 0 && dot(LightNormal(light), toCell) < -reach)
-                continue;
-            // Its power over the squared distance.
-            target = power / max(dot(toCell, toCell), halfDiagonal2);
-        }
+        float target = CellTarget(light, lampIndex, centre, reach, halfDiagonal2);
         if (!(target > 0))
             continue;
         float w = target / probability;  // the target over the candidate's probability
@@ -852,6 +1317,26 @@ void main(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint thread 
         NearPass(group.x, thread);
     else if (Pass == 10)
         NearLampsPass(id.x);
-    else
+    else if (Pass == 11)
         ThresholdPass(id.x);
+    else if (Pass == 12)
+        CutoffPass(thread);
+    else if (Pass == 13)
+        TreeLeavesPass(id.x);
+    else if (Pass == 14)
+        TreeKeysPass(id.x);
+    else if (Pass == 15)
+        TreeSortChunkPass(group.x, thread, true);
+    else if (Pass == 16)
+        TreeSortGlobalPass(id.x);
+    else if (Pass == 17)
+        TreeSortChunkPass(group.x, thread, false);
+    else if (Pass == 18)
+        TreeNodesPass(id.x);
+    else if (Pass == 19)
+        TreeSlotsPass(id.x);
+    else if (Pass == 20)
+        LevelCellsPass(id.x);
+    else
+        LevelSlotsPass(group.x, thread);
 }

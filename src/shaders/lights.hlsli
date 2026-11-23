@@ -301,6 +301,26 @@ static const uint kLightLampStart = 3;       // the list's first lamp entry
 static const uint kLightArguments = 4;       // 3 words: the triangle pass's dispatch (ExecuteIndirect)
 static const uint kLightTotalPower = 8;      // asfloat: the listed triangles' power summed
 static const uint kLightActive = 9;          // 1: complete and with power: next-event estimation is on
+static const uint kLightCutoff = 10;         // the first distance bin left out (kLightDistanceBins: none)
+static const uint kLightBins = 16;           // 2 words per distance bin: its parts, their triangles
+// The light tree (light_tree.hlsli, emissive_lights.hlsl passes 13-19).
+static const uint kLightTreeLow = 48;        // 3 words: the leaves' centres' low corner (~OrderedFloat, by max)
+static const uint kLightTreeHigh = 51;       // 3 words: their high corner (OrderedFloat, by max)
+static const uint kLightTreeLeaves = 54;     // its leaves: the parts, then the lamps
+static const uint kLightTreeSorted = 55;     // those the sort took (at most its size)
+static const uint kLightTreeRoot = 56;       // its root: a node, kTreeLeaf | a leaf, or kTreeNone
+static const uint kLightLevelFill = 57;      // the grid's coarse cells to fill this frame (pass 20's list)
+static const uint kLightCounterWords = 58;   // the words the reset pass clears
+
+// The parts listed (emissive_lights.hlsl PartsPass, CutoffPass): those of TLAS instances whose origin lies
+// within kLightPartReach metres of the grid's box (beyond it, a part's light reaches none of the grid's
+// cells: kNearReach, with room for the part's extent), the nearest first, by distance bins of
+// kLightBinMeters from the camera, as many bins as fit the capacities with the lamps. Over the capacity the
+// whole list was dropped: no lamp or emitter lit anything in the grid (the scenarios Sparks of the Future and
+// Asteroid Armory: 300-600 thousand triangles of the whole world's emissive parts).
+static const uint kLightDistanceBins = 16;
+static const float kLightBinMeters = 6.0;
+static const float kLightPartReach = 24.0;
 
 RWStructuredBuffer<float4> MaterialLight : register(u9);  // per material: x the most emission, y the mean (luminance)
 RWStructuredBuffer<uint4> LightParts : register(u10);     // TLAS instance, record, triangles | part << 24, first

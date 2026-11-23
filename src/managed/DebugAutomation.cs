@@ -117,6 +117,19 @@ namespace SpaceEngineers.RTHWAccel
                 Step(GateMode.Replace, DebugView.Lit, 7, round == 0 ? "lit-replace-decal-lights" : null);
             }
             NativeApi.RtSetDecalLights(settings.DecalLights);
+            // The light tree against the light grid (P2z), A/B in the same view within the session: windows with
+            // each in turn (the log's "gate mode is now" lines say "light tree" for the former), the emitters' light
+            // alone from the tree (against "emitters" below, from the grid), then as the settings have it.
+            for (int round = 0; round < 3; ++round)
+            {
+                NativeApi.RtSetLightTree(true);
+                Step(GateMode.Replace, DebugView.Lit, 7, round == 0 ? "lit-replace-tree" : null);
+                NativeApi.RtSetLightTree(false);
+                Step(GateMode.Replace, DebugView.Lit, 7, round == 0 ? "lit-replace-grid" : null);
+            }
+            NativeApi.RtSetLightTree(true);
+            Step(GateMode.Replace, DebugView.Emitters, 8, "emitters-tree");
+            NativeApi.RtSetLightTree(settings.LightTree);
             // Emissive surfaces as lights alone (replace: without the game's local lights on top), then the same
             // without reusing light samples: the unbiased reference the reuse must match on average (the log's
             // sampled diffuse light, and the accumulated images).
@@ -140,6 +153,19 @@ namespace SpaceEngineers.RTHWAccel
             Step(GateMode.Replace, DebugView.EmittersReference, 8, "emitters-reference-character");
             Step(GateMode.Replace, DebugView.EmittersPowerGrid, 8, "emitters-power-grid-character");
             Step(GateMode.Off, null, 6, "game-character");
+            // From afar (P2z): the spectator 80 m beyond the player's grid, looking back at it; the game's frame, then
+            // the traced light with the light grid's coarse levels (lamps and emitters traced at any distance) and
+            // without them (beyond 32 m the game's own lamp light), A/B; then as the settings have it.
+            ViewFromAfar(80.0);
+            Step(GateMode.Off, null, 6, "game-far");
+            for (int round = 0; round < 2; ++round)
+            {
+                NativeApi.RtSetLightTree(true);
+                Step(GateMode.Replace, DebugView.Lit, 8, round == 0 ? "lit-replace-far-tree" : null);
+                NativeApi.RtSetLightTree(false);
+                Step(GateMode.Replace, DebugView.Lit, 8, round == 0 ? "lit-replace-far-grid" : null);
+            }
+            NativeApi.RtSetLightTree(settings.LightTree);
             StartOrbit(10.0, 15.0);
             Step(GateMode.Replace, DebugView.Mismatch, 12, "mismatch-moving");
             Step(GateMode.Replace, DebugView.Parts, 10, "parts-moving");
@@ -281,10 +307,11 @@ namespace SpaceEngineers.RTHWAccel
             return placed;
         }
 
-        // [Debug] LookAtSkins (armor skin subtypes, comma-separated; "block:<subtype>" for a block type): per entry, the
-        // spectator 3 m from the matching block nearest to the camera (on the camera's side), then the game's frame,
-        // the comparison of the traced material with the G-buffer (the log's "traced material" line of the window) and
-        // the traced light, with screenshots.
+        // [Debug] LookAtSkins (armor skin subtypes, comma-separated; "block:<subtype>" for a block type;
+        // "view:<subtype>@<eye>><target>[|<point>...]" for a view of one, LookFrom): per entry, the spectator 3 m from
+        // the matching block nearest to the camera (on the camera's side), then the game's frame, the comparison of the
+        // traced material with the G-buffer (the log's "traced material" line of the window) and the traced light,
+        // with screenshots.
         private static void SkinSequence(Settings settings)
         {
             foreach (string entry in settings.LookAtSkins.Split(','))
@@ -292,13 +319,15 @@ namespace SpaceEngineers.RTHWAccel
                 string skin = entry.Trim();
                 if (skin.Length == 0)
                     continue;
+                bool view = skin.StartsWith("view:", StringComparison.OrdinalIgnoreCase);
+                Vector3D[] points = null;
                 bool found = false;
                 bool done = false;
                 MySandboxGame.Static.Invoke(() =>
                 {
                     try
                     {
-                        found = LookAtSkin(skin);
+                        found = view ? LookFrom(skin, out points) : LookAtSkin(skin);
                     }
                     catch (Exception exception)
                     {
@@ -313,6 +342,35 @@ namespace SpaceEngineers.RTHWAccel
                 if (!found)
                     continue;
                 Thread.Sleep(TimeSpan.FromSeconds(3));  // textures stream in
+                if (view)
+                {
+                    // The view's points as probes (the camera has moved by now), through the material views, the
+                    // parts view and the traced light.
+                    string name = skin.Substring(5, Math.Max(0, skin.IndexOf('@') - 5));
+                    int[] pixels = null;
+                    done = false;
+                    MySandboxGame.Static.Invoke(() =>
+                    {
+                        try
+                        {
+                            pixels = ProbePixels(points);
+                        }
+                        finally
+                        {
+                            done = true;
+                        }
+                    }, Plugin.Name);
+                    Plugin.WaitUntil(() => done, TimeSpan.FromSeconds(10));
+                    if (pixels != null && pixels.Length >= 2)
+                        NativeApi.RtSetProbes(pixels);
+                    Step(GateMode.Off, null, 5, $"view-{name}-game");
+                    Step(GateMode.Replace, DebugView.BaseColor, 5, $"view-{name}-basecolor");
+                    Step(GateMode.Replace, DebugView.MaterialCompare, 6, $"view-{name}-materialcompare");
+                    Step(GateMode.Replace, DebugView.Parts, 5, $"view-{name}-parts");
+                    Step(GateMode.Replace, DebugView.Lit, 8, $"view-{name}-lit-replace");
+                    NativeApi.RtSetProbes(settings.Probes);
+                    continue;
+                }
                 string label = skin.Replace(':', '-');  // file names
                 // A block type is looked at from above: probes at the middle of the view say what the rays hit there.
                 bool byBlock = skin.StartsWith("block:", StringComparison.OrdinalIgnoreCase);
@@ -415,6 +473,128 @@ namespace SpaceEngineers.RTHWAccel
             return true;
         }
 
+        // Update thread. "view:<subtype>@<eye>><target>[|<point>...]" (LookAtSkins): the spectator at <eye> in the
+        // model space of the block of that type nearest to the camera (metres, "x y z"), looking at <target>, its up
+        // the block's; `points`: the further points (up to 8, the same space) in the world, for probes (ProbePixels).
+        // Whether such a block was found.
+        private static bool LookFrom(string entry, out Vector3D[] points)
+        {
+            points = new Vector3D[0];
+            MySession session = MySession.Static;
+            VRage.Game.Utils.MyCamera camera = MySector.MainCamera;
+            if (session == null || camera == null)
+                return false;
+            string spec = entry.Substring(5);
+            int at = spec.IndexOf('@');
+            int toward = at > 0 ? spec.IndexOf('>', at + 1) : -1;
+            string[] tail = toward > 0 ? spec.Substring(toward + 1).Split('|') : new string[0];
+            if (toward < 0 || !TryPoint(spec.Substring(at + 1, toward - at - 1), out Vector3D eyeLocal) ||
+                !TryPoint(tail[0], out Vector3D targetLocal))
+            {
+                Log.Warning($"View: \"{entry}\" is not view:<subtype>@<x y z>><x y z>[|<x y z>...].");
+                return false;
+            }
+            string subtype = spec.Substring(0, at);
+            Vector3D eye = camera.Position;
+            MyCubeBlock best = null;
+            double bestDistance = double.MaxValue;
+            int count = 0;
+            foreach (var entity in MyEntities.GetEntities())
+            {
+                if (!(entity is MyCubeGrid grid))
+                    continue;
+                foreach (Sandbox.Game.Entities.Cube.MySlimBlock block in grid.GetBlocks())
+                {
+                    if (block.FatBlock == null || block.BlockDefinition.Id.SubtypeName != subtype)
+                        continue;
+                    ++count;
+                    double distance = Vector3D.DistanceSquared(block.FatBlock.PositionComp.GetPosition(), eye);
+                    if (distance < bestDistance)
+                    {
+                        best = block.FatBlock;
+                        bestDistance = distance;
+                    }
+                }
+            }
+            if (best == null)
+            {
+                Log.Info($"View: no {subtype} block.");
+                return false;
+            }
+            MatrixD world = best.WorldMatrix;
+            Vector3D position = Vector3D.Transform(eyeLocal, world);
+            Vector3D target = Vector3D.Transform(targetLocal, world);
+            session.SetCameraController(MyCameraControllerEnum.Spectator, null, position);
+            MySpectatorCameraController spectator = MySpectatorCameraController.Static;
+            if (spectator != null)
+            {
+                spectator.Position = position;
+                spectator.SetTarget(target, world.Up);
+            }
+            var list = new System.Collections.Generic.List<Vector3D>();
+            for (int i = 1; i < tail.Length && list.Count < 8; i++)
+            {
+                if (TryPoint(tail[i], out Vector3D local))
+                    list.Add(Vector3D.Transform(local, world));
+            }
+            points = list.ToArray();
+            Log.Info($"View: {count} {subtype} blocks; looking at the one of {best.CubeGrid.DisplayName}, " +
+                     $"{Math.Sqrt(bestDistance):F1} m from the camera, from ({eyeLocal.X:F2}, {eyeLocal.Y:F2}, " +
+                     $"{eyeLocal.Z:F2}) in its model space; {points.Length} probe points.");
+            return true;
+        }
+
+        // "x y z" (invariant culture).
+        private static bool TryPoint(string text, out Vector3D point)
+        {
+            point = Vector3D.Zero;
+            string[] parts = text.Trim().Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            var culture = System.Globalization.CultureInfo.InvariantCulture;
+            const System.Globalization.NumberStyles style = System.Globalization.NumberStyles.Float;
+            if (parts.Length != 3 || !double.TryParse(parts[0], style, culture, out double x) ||
+                !double.TryParse(parts[1], style, culture, out double y) ||
+                !double.TryParse(parts[2], style, culture, out double z))
+                return false;
+            point = new Vector3D(x, y, z);
+            return true;
+        }
+
+        // Update thread: the pixels (x, y pairs) where world points lie in the main camera's view, through its
+        // view-projection matrix; points off the screen are left out.
+        private static int[] ProbePixels(Vector3D[] points)
+        {
+            var pixels = new System.Collections.Generic.List<int>();
+            VRage.Game.Utils.MyCamera camera = MySector.MainCamera;
+            if (camera == null || points == null)
+                return pixels.ToArray();
+            MatrixD m = camera.ViewProjectionMatrix;
+            double width = camera.Viewport.Width;
+            double height = camera.Viewport.Height;
+            for (int i = 0; i < points.Length; i++)
+            {
+                Vector3D p = points[i];
+                double cx = p.X * m.M11 + p.Y * m.M21 + p.Z * m.M31 + m.M41;
+                double cy = p.X * m.M12 + p.Y * m.M22 + p.Z * m.M32 + m.M42;
+                double cw = p.X * m.M14 + p.Y * m.M24 + p.Z * m.M34 + m.M44;
+                if (cw <= 1e-6)
+                {
+                    Log.Info($"View: probe point {i} lies behind the camera.");
+                    continue;
+                }
+                int x = (int)Math.Floor((cx / cw * 0.5 + 0.5) * width);
+                int y = (int)Math.Floor((0.5 - cy / cw * 0.5) * height);
+                if (x < 0 || y < 0 || x >= width || y >= height)
+                {
+                    Log.Info($"View: probe point {i} lies off the screen ({x}, {y}).");
+                    continue;
+                }
+                Log.Info($"View: probe point {i} at pixel ({x}, {y}) of {width}x{height}.");
+                pixels.Add(x);
+                pixels.Add(y);
+            }
+            return pixels.ToArray();
+        }
+
         private static volatile bool s_orbit;
 
         // The spectator camera circles the player once per `period` seconds at
@@ -470,6 +650,55 @@ namespace SpaceEngineers.RTHWAccel
                 }
                 Log.Info($"Inspector: spectator {distance} m in front of the player character" +
                          $"{(character.IsSitting ? " (seated)" : "")}.");
+            }, Plugin.Name);
+        }
+
+        // The spectator camera `distance` metres beyond the bounding sphere of the largest grid within 100 m of the
+        // player character (of the character itself without one), across the sun's direction and a little away
+        // from it, above (the sun out of view, the grid's shadowed side in it), looking at its centre: where the
+        // traced lamps' reach shows.
+        private static void ViewFromAfar(double distance)
+        {
+            MySandboxGame.Static.Invoke(() =>
+            {
+                MySession session = MySession.Static;
+                MyCharacter character = session?.LocalCharacter;
+                if (character == null)
+                {
+                    Log.Info("Inspector: no player character.");
+                    return;
+                }
+                MatrixD world = character.WorldMatrix;
+                Vector3D target = world.Translation;
+                double radius = 0;
+                MyCubeGrid largest = null;
+                foreach (var entity in MyEntities.GetEntities())
+                {
+                    if (entity is MyCubeGrid grid &&
+                        Vector3D.Distance(grid.PositionComp.WorldAABB.Center, target) < 100 &&
+                        (largest == null || grid.BlocksCount > largest.BlocksCount))
+                        largest = grid;
+                }
+                if (largest != null)
+                {
+                    target = largest.PositionComp.WorldAABB.Center;
+                    radius = largest.PositionComp.WorldVolume.Radius;
+                }
+                Vector3D toSun = MySector.DirectionToSunNormalized;
+                Vector3D across = Vector3D.Cross(toSun, world.Up);
+                if (across.LengthSquared() < 1e-6)
+                    across = Vector3D.Cross(toSun, world.Forward);
+                across.Normalize();
+                Vector3D eye = target + Vector3D.Normalize(across - toSun * 0.4 + world.Up * 0.3) * (radius + distance);
+                session.SetCameraController(MyCameraControllerEnum.Spectator, null, eye);
+                MySpectatorCameraController spectator = MySpectatorCameraController.Static;
+                if (spectator != null)
+                {
+                    spectator.Position = eye;
+                    spectator.SetTarget(target, world.Up);
+                }
+                Log.Info($"Inspector: spectator {radius + distance:F0} m from " +
+                         $"{(largest != null ? "the grid " + largest.DisplayName : "the player character")}, afar.");
             }, Plugin.Name);
         }
 

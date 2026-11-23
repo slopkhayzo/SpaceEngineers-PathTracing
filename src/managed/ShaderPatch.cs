@@ -77,28 +77,31 @@ namespace SpaceEngineers.RTHWAccel
         };
 
         // The lamp passes (tiled point lights, spot lights) leave the pixels whose lamps the traced light
-        // covers: where the overlay is opaque and the surface lies inside the light grid, where the traced
-        // light samples the lamps (src/shaders/lights.hlsli InLightGrid: 32 cells of 2 m across, around the
-        // camera; keep the two alike). The light they add elsewhere is scaled as the traced lamps' is: the
-        // LampIntensity setting, in t23 (x; y = 1), which the plugin binds with the overlay while the traced
-        // light is on (rt_core.cpp BindLighting). Unbound, as with the gate off, it reads zero: the game's own
-        // lamp light, unscaled, so that switching the traced light off restores the game's look.
+        // covers: where the overlay is opaque and the traced light samples the lamps there: everywhere with the
+        // light tree, else inside the light grid (src/shaders/lights.hlsli InLightGrid: 32 cells of 2 m across,
+        // around the camera; keep the two alike). The light they add elsewhere is scaled as the traced lamps'
+        // is: the LampIntensity setting, in t23 (x; y 1 with the light grid, 2 with the tree), which the plugin
+        // binds with the overlay while the traced light is on (rt_core.cpp BindLighting). Unbound, as with the
+        // gate off, it reads zero: the game's own lamp light, unscaled, so that switching the traced light off
+        // restores the game's look.
         private static readonly string[] LampShare =
         {
             "// " + Marker + ": ray-traced lighting, bound by the plugin (an unbound slot reads zero).",
             "Texture2D<float4> RtOverlay : register(t22);",
-            "// " + Marker + ": x the LampIntensity setting, y 1; bound with the overlay while the traced light is on.",
+            "// " + Marker + ": x the LampIntensity setting, y 1 (light grid) or 2 (light tree); bound with the",
+            "// overlay while the traced light is on.",
             "Texture2D<float2> RtLampScale : register(t23);",
             "// " + Marker + ": the share of the lamp's light this pass adds: none where the traced light covers",
-            "// the pixel and traces the lamps (inside its light grid, camera-relative), the rest scaled as the",
-            "// traced lamps are; all of it, as the game sets it, while the traced light is off.",
+            "// the pixel and traces the lamps (everywhere with the light tree, else inside the light grid,",
+            "// camera-relative), the rest scaled as the traced lamps are; all of it, as the game sets it, while the",
+            "// traced light is off.",
             "float RtLampShare(float2 pixel, float3 position)",
             "{",
             "    float2 scale = RtLampScale[uint2(0, 0)];",
             "    if (scale.y == 0)",
             "        return 1;",
             "    float3 cell = floor(position / 2.0) + 16;",
-            "    bool inGrid = all(cell >= 0) && all(cell < 32);",
+            "    bool inGrid = scale.y > 1.5 || (all(cell >= 0) && all(cell < 32));",
             "    return (inGrid ? 1 - RtOverlay[uint2(pixel)].a : 1) * scale.x;",
             "}",
         };

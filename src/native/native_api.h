@@ -35,6 +35,9 @@ struct RtOptions {
     // Glowing decals (indicator lights, signs) light their surroundings (1) or
     // only glow where they are seen (0).
     std::int32_t decalLights;
+    // Lamps and emitters traced at any distance (1: the light grid's coarse
+    // levels, filled from the light tree) or 32 m around the camera (0).
+    std::int32_t lightTree;
 };
 
 static_assert(sizeof(RtOptions) == 48);
@@ -44,6 +47,7 @@ static_assert(offsetof(RtOptions, characterLights) == 28);
 static_assert(offsetof(RtOptions, lampIntensity) == 32);
 static_assert(offsetof(RtOptions, emissiveIntensity) == 36);
 static_assert(offsetof(RtOptions, decalLights) == 40);
+static_assert(offsetof(RtOptions, lightTree) == 44);
 
 // Function table handed to the managed side; its address travels in the
 // argument of the managed entry point. The layout is mirrored in
@@ -103,10 +107,14 @@ struct NativeApi {
     // Whether glowing decals light their surroundings (1) or only glow (0),
     // from the next frame on; starts a fresh statistics window.
     void(__cdecl* rtSetDecalLights)(int on);
+    // Whether the lit views trace lamps and emitters at any distance (1) or
+    // 32 m around the camera (0), from the next frame on; starts a fresh
+    // statistics window.
+    void(__cdecl* rtSetLightTree)(int on);
 };
 
 // The managed side reads the table by these offsets (NativeApi.cs).
-static_assert(sizeof(NativeApi) == 232);
+static_assert(sizeof(NativeApi) == 240);
 static_assert(offsetof(NativeApi, createHook) == 8);
 static_assert(offsetof(NativeApi, applyQueued) == 16);
 static_assert(offsetof(NativeApi, removeHook) == 24);
@@ -135,6 +143,7 @@ static_assert(offsetof(NativeApi, rtLightsSubmit) == 200);
 static_assert(offsetof(NativeApi, rtSkinsSubmit) == 208);
 static_assert(offsetof(NativeApi, rtDecalsSubmit) == 216);
 static_assert(offsetof(NativeApi, rtSetDecalLights) == 224);
+static_assert(offsetof(NativeApi, rtSetLightTree) == 232);
 
 [[nodiscard]] bool InitializeHooking();
 [[nodiscard]] const NativeApi* GetNativeApi();

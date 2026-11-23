@@ -656,7 +656,18 @@ void MarkDirty(const std::uint32_t first, const std::uint32_t count) {
     s.dirtyEnd = std::max(s.dirtyEnd, first + count);
 }
 
+// kRecordMeshDecals when `mesh` has decal parts, for every record of it.
+std::uint32_t MeshDecalsFlag(const Mesh& mesh) {
+    for (const RtMeshPart& part : mesh.parts) {
+        if ((part.flags & (kPartDecal | kPartDecalCutout)) != 0) {
+            return kRecordMeshDecals;
+        }
+    }
+    return 0;
+}
+
 void PublishRecords(const Mesh& mesh) {
+    const std::uint32_t decals = MeshDecalsFlag(mesh);
     for (std::size_t p = 0; p < mesh.parts.size(); ++p) {
         const RtMeshPart& part = mesh.parts[p];
         GeometryRecord& record = s.records[mesh.firstRecord + p];
@@ -675,7 +686,7 @@ void PublishRecords(const Mesh& mesh) {
                         (mesh.positionFormat == PositionFormat::float3 ? 1u << 17 : 0u);
         record.material = part.material < s.materials.size() ? part.material : 0;
         record.flags = (part.flags & 0xFFu) | (static_cast<std::uint32_t>(mesh.kind) << 8) |
-                       (mesh.bones ? 1u << 16 : 0u);
+                       (mesh.bones ? 1u << 16 : 0u) | decals;
         record.counts = std::min<std::uint32_t>(part.indexCount / 3, 0xFFFFFFu) |
                         (std::min<std::uint32_t>(mesh.recordCount, 255u) << 24);
     }
@@ -964,6 +975,7 @@ void SkinGeometries(const Skin& skin, const Mesh& geometry, std::vector<D3D12_RA
 
 // The pose's records: `mesh`'s parts (its materials: a variant's own) over the pose's geometry.
 void PublishSkinRecords(const Skin& skin, const Mesh& mesh, const Mesh& geometry) {
+    const std::uint32_t decals = MeshDecalsFlag(mesh);
     for (std::size_t p = 0; p < mesh.parts.size(); ++p) {
         const RtMeshPart& part = mesh.parts[p];
         GeometryRecord& record = s.records[skin.firstRecord + p];
@@ -982,7 +994,7 @@ void PublishSkinRecords(const Skin& skin, const Mesh& mesh, const Mesh& geometry
                         static_cast<std::uint32_t>(previous / kPreviousUnit) << kPreviousShift;
         record.material = part.material < s.materials.size() ? part.material : 0;
         record.flags = (part.flags & 0xFFu) | (static_cast<std::uint32_t>(geometry.kind) << 8) |
-                       (geometry.bones ? 1u << 16 : 0u);
+                       (geometry.bones ? 1u << 16 : 0u) | decals;
         record.counts = std::min<std::uint32_t>(part.indexCount / 3, 0xFFFFFFu) |
                         (std::min<std::uint32_t>(skin.recordCount, 255u) << 24);
     }
@@ -1694,10 +1706,11 @@ static_assert(sizeof(GpuLamp) == 80);
 
 // The frame's lamps (SceneSubmitLights) for the light list, around `camera`:
 // those whose range reaches the light grid (lights.hlsli; beyond it the game's
-// own lamp passes light the pixels). A spot light's mask is its mask
-// material's alpha-mask slot, whose fallback while the texture loads is white
-// (the whole cone).
-void UploadLamps(Upload& upload, const double camera[3], SceneFrame& frame) {
+// own lamp passes light the pixels), or all of them (`allLamps`: the light
+// tree, which has no extent). A spot light's mask is its mask material's
+// alpha-mask slot, whose fallback while the texture loads is white (the whole
+// cone).
+void UploadLamps(Upload& upload, const double camera[3], SceneFrame& frame, const bool allLamps) {
     const std::size_t capacity = std::min<std::size_t>(s.lights.size(), kMaxLamps);
     const UINT64 offset = upload.Allocate(std::max<std::size_t>(capacity, 1) * sizeof(GpuLamp), 16);
     if (offset == kNoSpace) {
@@ -1720,7 +1733,7 @@ void UploadLamps(Upload& upload, const double camera[3], SceneFrame& frame) {
             lamp.direction[axis] = light.direction[axis];
             lamp.up[axis] = light.up[axis];
         }
-        if (!(light.range > 0) || outside >= light.range * light.range) {
+        if (!(light.range > 0) || (!allLamps && outside >= light.range * light.range)) {
             continue;
         }
         lamp.range = light.range;
@@ -2500,7 +2513,7 @@ void SceneCopyIn(ID3D11DeviceContext* immediate) {
 
 SceneFrame SceneRecord(ID3D12GraphicsCommandList4* list, const std::size_t slot, const double camera[3],
                        const double* previousCamera,
-                       const UINT64 retireAfter) {
+                       const UINT64 retireAfter, const bool allLamps) {
     if (!s.ready || slot >= kUploadSlots) {
         return {};
     }
@@ -2520,7 +2533,7 @@ SceneFrame SceneRecord(ID3D12GraphicsCommandList4* list, const std::size_t slot,
     UploadVoxelMaterials(list, upload);
     SceneFrame frame = BuildTopLevel(list, upload, camera, previousCamera);
     if (frame.tlas != 0) {
-        UploadLamps(upload, camera, frame);
+        UploadLamps(upload, camera, frame, allLamps);
         UploadDecals(list, upload, camera, frame);
     }
     ++s.stats.frames;

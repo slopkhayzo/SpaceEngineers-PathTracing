@@ -32,10 +32,15 @@ constexpr std::uint32_t kPartHideable = 4u;  // the game hides it at times: non-
 constexpr std::uint32_t kPartDecal = 8u;
 constexpr std::uint32_t kPartDecalPremultiplied = 16u;
 // A cutout decal (the game's STATIC_DECAL_CUTOUT; also kPartAlphaMasked): solid for the camera's rays only, as it
-// lies a few millimetres above its surface (no slivers of shadow, no alpha tests in the bounces).
+// lies on its surface (no slivers of shadow, no alpha tests in the bounces).
 constexpr std::uint32_t kPartDecalCutout = 32u;
 // The parts the rays test instead of taking as solid.
 constexpr std::uint32_t kPartNonOpaque = kPartAlphaMasked | kPartHideable | kPartDecal;
+// Record flag (bit 17, above the part flags, the kind and bit 16's bones): the record's mesh has decal parts
+// (kPartDecal, kPartDecalCutout). The game draws decals a little nearer than they lie, and many lie exactly on their
+// surface once its half-float positions rounded both alike: where the camera's ray stops on such a mesh, it looks
+// for a decal within that margin behind (scene_common.hlsli TraceClosestDecals).
+constexpr std::uint32_t kRecordMeshDecals = 1u << 17;
 
 // A material: the files of its four texture slots (absolute paths, as the
 // game's MyFileTexture.m_path; null: the game's default for the slot), or a
@@ -294,8 +299,10 @@ void SceneCopyIn(ID3D11DeviceContext* immediate);
 // is in use.
 // `previousCamera`: the previous recorded frame's camera (null: none), around
 // which the instances' transforms of then are placed (motion vectors).
+// `allLamps`: every lamp, at any distance (the light tree), else those that
+// reach the light grid.
 [[nodiscard]] SceneFrame SceneRecord(ID3D12GraphicsCommandList4* list, std::size_t slot, const double camera[3],
-                                     const double* previousCamera, UINT64 retireAfter);
+                                     const double* previousCamera, UINT64 retireAfter, bool allLamps);
 
 // Frees memory retired before `completed` (the D3D12 fence value).
 void SceneCollect(UINT64 completed);
