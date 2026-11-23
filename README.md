@@ -10,16 +10,17 @@
 Path-traced lighting for *Space Engineers* (Steam, 64-bit), delivered as an
 ASI plugin like [SpaceEngineers.HighFPSFix](https://github.com/slopkhayzo/SpaceEngineers-HighFPS-RIL).
 
-**Status: 0.2.0.** The plugin replaces the game's lighting with light traced
+**Status: 0.3.0.** The plugin replaces the game's lighting with light traced
 by the GPU's ray-tracing hardware:
 - sunlight with soft shadows, and light from the sky;
-- the game's lamps within 32 m of the camera, with shadows;
+- the game's lamps, at any distance, with shadows;
 - light cast by glowing surfaces (screens, keypads, light strips, glowing
   decals, suits);
 - one bounce of indirect light, diffuse and glossy.
 
-The traced frame includes the decals the game projects onto blocks (bullet
-holes and the like) and the blocks' armor skins.
+The traced frame includes the blocks' own decals (labels, vent grilles,
+keyholes), the decals the game projects onto blocks (bullet holes and the
+like) and the blocks' armor skins.
 
 The traced light is denoised by NVIDIA DLSS Ray Reconstruction on GeForce
 RTX GPUs, and by the plugin's own filter on other GPUs. The game still

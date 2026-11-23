@@ -7,8 +7,7 @@ This plugin replaces the game's lighting with light traced by the GPU's
 ray-tracing hardware:
 
 - Sunlight with soft shadows, and light from the sky
-- The game's lamps within 32 m of the camera, with shadows (beyond that,
-  the game's own lamp light)
+- The game's lamps, at any distance, with shadows
 - Light cast by glowing surfaces: screens, keypads, light strips, glowing
   decals such as indicator lights and signs, and the glowing parts of
   character suits
@@ -22,10 +21,12 @@ glass and other transparent surfaces, particles, post-processing and the
 HUD. Only what you see changes: the simulation, the game's files and your
 saves are untouched.
 
-Version 0.2.0 adds bullet holes and the other projected decals, makes
-glowing decals light their surroundings, fixes armor skins on panels,
-interior walls and functional blocks, and lights cavities seen through an
-opening (such as the Collector's funnel), which were black.
+Version 0.3.0 traces the light of lamps and glowing surfaces at any
+distance (in 0.2.0 it ended 32 m from the camera), keeps every lamp lit in
+worlds with very many glowing parts (such as Sparks of the Future and
+Asteroid Armory, where they all went dark), and shows the decals that lie
+flat on a block, such as vent grilles, keyholes and labels, which were
+missing.
 
 Requirements
 ------------
@@ -48,7 +49,7 @@ it.
 Performance
 -----------
 The light is traced at the game's full resolution every frame. On a
-GeForce RTX 4090 at 1920x1080 this takes about 6 ms of GPU time per frame
+GeForce RTX 4090 at 1920x1080 this takes about 8 ms of GPU time per frame
 in ships and stations, and 8 to 14 ms on planets and in caves. Higher
 resolutions cost more.
 
@@ -64,6 +65,9 @@ the next time the game starts. The main ones, under [RayTracing]:
   filter.
 - DecalLights = false makes glowing decals only glow, as in the game,
   without lighting their surroundings.
+- LightTree = false traces lamps and glowing surfaces within 32 m of the
+  camera only, as 0.2.0 did (beyond that, the game's own lamp light): a
+  little cheaper.
 Set Enabled = false under [General] to switch the plugin off without
 removing it.
 
@@ -83,6 +87,8 @@ Not covered
 - Grass and glass are not ray traced: they keep the game's look. Light
   passes through glass.
 - Decals do not show in reflections.
+- Textures seen at a grazing angle look blurrier than in the game: the
+  traced surfaces are not filtered anisotropically yet.
 - Textures of the traced scene stream in during the first minute after a
   world loads.
 - The plugin's own filter (GPUs without Ray Reconstruction, or
