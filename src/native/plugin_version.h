@@ -6,4 +6,4 @@
 #define SE_RTHWACCEL_VERSION L"" SE_RTHWACCEL_VERSION_ASCII
 
 // Version of the table in native_api.h; the managed side refuses other values.
-#define SE_RTHWACCEL_API_VERSION 16u
+#define SE_RTHWACCEL_API_VERSION 19u

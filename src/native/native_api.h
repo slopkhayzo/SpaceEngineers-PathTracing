@@ -38,9 +38,13 @@ struct RtOptions {
     // Lamps and emitters traced at any distance (1: the light grid's coarse
     // levels, filled from the light tree) or 32 m around the camera (0).
     std::int32_t lightTree;
+    // DLSS mode of Ray Reconstruction (rt::DlssMode): 0 DLAA (the light traced
+    // at the game's resolution), 1 quality, 2 balanced, 3 performance, 4 ultra
+    // performance (traced at a smaller size, Ray Reconstruction upscaling).
+    std::int32_t dlssMode;
 };
 
-static_assert(sizeof(RtOptions) == 48);
+static_assert(sizeof(RtOptions) == 56);
 static_assert(offsetof(RtOptions, tracePath) == 16);
 static_assert(offsetof(RtOptions, denoiser) == 24);
 static_assert(offsetof(RtOptions, characterLights) == 28);
@@ -48,6 +52,7 @@ static_assert(offsetof(RtOptions, lampIntensity) == 32);
 static_assert(offsetof(RtOptions, emissiveIntensity) == 36);
 static_assert(offsetof(RtOptions, decalLights) == 40);
 static_assert(offsetof(RtOptions, lightTree) == 44);
+static_assert(offsetof(RtOptions, dlssMode) == 48);
 
 // Function table handed to the managed side; its address travels in the
 // argument of the managed entry point. The layout is mirrored in
@@ -111,10 +116,33 @@ struct NativeApi {
     // 32 m around the camera (0), from the next frame on; starts a fresh
     // statistics window.
     void(__cdecl* rtSetLightTree)(int on);
+    // The DLSS mode of Ray Reconstruction (rt::DlssMode: 0 DLAA ... 4 ultra
+    // performance), from the next frame on; starts a fresh statistics window.
+    void(__cdecl* rtSetDlssMode)(int mode);
+    // One of the settings the game's options screen changes while playing
+    // (rt::Option: 0 denoiser, 1 character lights, 2 lamp intensity, 3
+    // emissive intensity), from the next frame on.
+    void(__cdecl* rtSetOption)(int option, float value);
+    // The presenter: 0 the game's swap chain presents, 1 ours (a D3D12
+    // flip-model chain over the game's window), 2 ours through Streamline
+    // (DLSS Frame Generation off), 3 that with DLSS-G on; the game's
+    // IDXGISwapChain (its first call hooks Present); `window` gets the game's
+    // window. 0 when set.
+    int(__cdecl* rtSetPresenter)(void* swapChain, int mode, void** window);
+    // On the thread of the game's window: the presenter's window made over
+    // it (until then the game's swap chain presents). 0 when made.
+    int(__cdecl* rtPresenterAttach)();
+    // Render thread, once the game drew its scene (before its HUD): the frame
+    // copied for frame generation (nothing without it).
+    void(__cdecl* rtCaptureHudless)();
+    // Whether frame generation can run: 0 yes, 1 not known yet (Streamline
+    // loads with the presenter), 2 no. `text` (`capacity` characters, ended
+    // by a 0) gets why not, or when it can, anything that hurts it.
+    int(__cdecl* rtFrameGenStatus)(wchar_t* text, int capacity);
 };
 
 // The managed side reads the table by these offsets (NativeApi.cs).
-static_assert(sizeof(NativeApi) == 240);
+static_assert(sizeof(NativeApi) == 288);
 static_assert(offsetof(NativeApi, createHook) == 8);
 static_assert(offsetof(NativeApi, applyQueued) == 16);
 static_assert(offsetof(NativeApi, removeHook) == 24);
@@ -144,6 +172,12 @@ static_assert(offsetof(NativeApi, rtSkinsSubmit) == 208);
 static_assert(offsetof(NativeApi, rtDecalsSubmit) == 216);
 static_assert(offsetof(NativeApi, rtSetDecalLights) == 224);
 static_assert(offsetof(NativeApi, rtSetLightTree) == 232);
+static_assert(offsetof(NativeApi, rtSetDlssMode) == 240);
+static_assert(offsetof(NativeApi, rtSetOption) == 248);
+static_assert(offsetof(NativeApi, rtSetPresenter) == 256);
+static_assert(offsetof(NativeApi, rtPresenterAttach) == 264);
+static_assert(offsetof(NativeApi, rtCaptureHudless) == 272);
+static_assert(offsetof(NativeApi, rtFrameGenStatus) == 280);
 
 [[nodiscard]] bool InitializeHooking();
 [[nodiscard]] const NativeApi* GetNativeApi();

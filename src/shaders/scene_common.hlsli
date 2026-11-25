@@ -85,6 +85,10 @@ cbuffer Primary : register(b0)
     uint OpenGeneration;    // primary_view.hlsl SeenThrough: the entries holding it count (from 1, now and then on)
     uint LightTreeOn;       // 1: light candidates from the light tree (light_tree.hlsli), everywhere; 0: the grid
     float DecalDepthBias;   // the game's decal depth bias, a share of the view depth (TraceClosestDecals)
+    // The game's G-buffer size: Width and Height but where Ray Reconstruction upscales the lit view's light from a
+    // smaller size (DLSS modes; primary_view.hlsl GBufferTexel).
+    uint GBufferWidth;
+    uint GBufferHeight;
 };
 
 // The game's own frame constants (MyCommon.FrameConstantsData), as its shaders read them.

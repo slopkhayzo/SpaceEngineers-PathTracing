@@ -56,6 +56,17 @@ enum class Denoiser : int {
     filter = 2,             // our filter (denoise.hlsl)
 };
 
+// The DLSS mode of Ray Reconstruction: the size the lit view's light is traced at, which Ray Reconstruction
+// upscales to the game's (NVIDIA's render sizes for each mode: dlss::RenderSize). Only where Ray Reconstruction
+// denoises a lit view in replace mode; our filter and the overlay composite trace at the game's size.
+enum class DlssMode : int {
+    dlaa = 0,              // the game's size (DLAA)
+    quality = 1,           // about 67 % per axis
+    balanced = 2,          // about 58 %
+    performance = 3,       // 50 %
+    ultraPerformance = 4,  // about 33 %
+};
+
 struct Options {
     GateMode gateMode = GateMode::overlay;
     DebugView debugView = DebugView::stripes;
@@ -67,6 +78,7 @@ struct Options {
     float emissiveIntensity = 1.0f;  // the light emissive surfaces cast (lights.hlsli Emission), not their own glow
     bool decalLights = true;  // glowing decals are lights (else they only glow; SetDecalLights changes it)
     bool lightTree = false;   // lamps and emitters traced at any distance (the grid's coarse levels, the tree)
+    DlssMode dlssMode = DlssMode::dlaa;  // Ray Reconstruction's upscaling (SetDlssMode changes it)
 };
 
 // Creates the D3D12 device on the adapter of the game's D3D11 device, the
@@ -103,6 +115,36 @@ void SetDecalLights(bool on);
 // frame on (the LightTree setting; the inspector's A/B); starts a fresh
 // statistics window.
 void SetLightTree(bool on);
+// Any thread. The DLSS mode of Ray Reconstruction (the DlssMode setting; the
+// inspector's A/B), from the next frame on; starts a fresh statistics window.
+void SetDlssMode(DlssMode mode);
+
+// The settings the game's options screen (the plugin's "Path tracing" screen) changes while playing, besides the
+// gate mode, the DLSS mode, the light tree and the decals' light, which have their own calls.
+enum class Option : int {
+    denoiser = 0,           // value: Denoiser
+    characterLights = 1,    // 0 or 1
+    lampIntensity = 2,      // 0 to 100: the lamps' light, traced and the game's own
+    emissiveIntensity = 3,  // 0 to 100: the light emissive surfaces cast
+    handOffOrder = 4,       // diagnostics: 0 the D3D12 commands recorded after the hand-off to D3D12, 1 before it
+                            // (the default: the driver submits the game's work meanwhile), 2 by turns per report
+                            // window
+    frameLimit = 5,         // frame generation: Reflex's frame limit in frames per second (0: none)
+    presentSync = 6,        // frame generation: our presents' sync interval (-1: the game's, 0, 1)
+    reflexMode = 7,         // frame generation: Reflex's mode (0 off, 1 low latency: the default, 2 with boost)
+    sampleThreads = 8,      // diagnostics: the thread sampler (sampler.h) on (1) or off (0)
+    last = sampleThreads,
+};
+// Any thread. One of the settings above, from the next frame on; starts a fresh statistics window.
+void SetOption(Option option, float value);
+
+// After Initialize: the presenter (presenter.h; `mode` a PresenterMode) on the game's swap chain `swapChain`
+// (an IDXGISwapChain); `window` (if not null) gets the game's window. False when it could not be set up.
+bool SetPresenter(void* swapChain, int mode, void** window);
+// On the thread of the game's window, after SetPresenter: the presenter's window made (PresenterAttachWindow).
+bool AttachPresenterWindow();
+// Render thread, once the game drew its scene: the frame before the HUD copied for frame generation.
+void CaptureHudless();
 
 // Up to 8 probe pixels (x | y << 16): the material views log what their rays
 // found there (primary_view.hlsl) with each statistics window. 0 = none.

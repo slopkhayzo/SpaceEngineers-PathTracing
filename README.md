@@ -23,7 +23,8 @@ keyholes), the decals the game projects onto blocks (bullet holes and the
 like) and the blocks' armor skins.
 
 The traced light is denoised by NVIDIA DLSS Ray Reconstruction on GeForce
-RTX GPUs, and by the plugin's own filter on other GPUs. The game still
+RTX GPUs, and by the plugin's own filter on other GPUs. NVIDIA DLSS Frame
+Generation is optional on GeForce RTX 40 and 50 series GPUs. The game still
 draws fog, atmosphere, transparent surfaces, particles, post-processing and
 the HUD.
 
@@ -65,6 +66,16 @@ rests on and the progress log are in the private
   neighbouring pixels.
 - **Denoising.** DLSS Ray Reconstruction (NVIDIA RTX), or the plugin's own
   spatio-temporal filter.
+- **Frame generation.** DLSS Frame Generation only works on a D3D12 swap
+  chain, and the game presents through D3D11. So the plugin's presenter
+  takes over the game's `Present`. It copies each finished frame into a
+  D3D12 flip-model swap chain on a child window covering the game's client
+  area, made through NVIDIA Streamline's proxies (with manual hooking).
+  The traced frame hands Streamline its camera, motion and hardware depth
+  on the ray-tracing command list. The presenter adds the frame before the
+  HUD (copied right after the game draws its scene) and a UI layer (where
+  the finished frame differs from it). DLSS-G presents the real and the
+  generated frames from its own thread.
 - **Composite.** At start the plugin applies a runtime patch to the game's
   `Lighting/LightDir.hlsl`. The patch works on a copy of the game's shader
   tree in `%LOCALAPPDATA%\SpaceEngineers.RTHWAccel`, which the plugin
@@ -83,11 +94,15 @@ You need:
 DLSS Ray Reconstruction is optional. [scripts/fetch_dlss.ps1](scripts/fetch_dlss.ps1)
 downloads the pinned NVIDIA DLSS SDK files into `third_party/dlss`
 (see its `UPSTREAM.md`), and the build enables Ray Reconstruction when they
-are present.
+are present. DLSS Frame Generation is optional the same way:
+[scripts/fetch_streamline.ps1](scripts/fetch_streamline.ps1) downloads the
+pinned NVIDIA Streamline SDK into `third_party/streamline`, checked against
+its SHA-256 and NVIDIA's signature.
 
 ```bat
 "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
 powershell -ExecutionPolicy Bypass -File scripts\fetch_dlss.ps1
+powershell -ExecutionPolicy Bypass -File scripts\fetch_streamline.ps1
 cmake -S . -B build-x64 -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo ^
   -DSERT_GAME_BIN64="D:/Program Files/Games/Steam/steamapps/common/SpaceEngineers/Bin64"
 cmake --build build-x64
@@ -163,9 +178,14 @@ excluded from Git. `research/tools` links to the shared tools folder.
   (binary not stored in Git) for the loader-bundled archive.
 - [NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS) (not stored in Git) for
   Ray Reconstruction, under the NVIDIA RTX SDKs License.
+- [NVIDIA Streamline](https://github.com/NVIDIAGameWorks/Streamline) (not
+  stored in Git) for DLSS Frame Generation and Reflex. Streamline is under
+  the MIT License, DLSS-G under the NVIDIA RTX SDKs License, and Reflex
+  under the NVIDIA SDK license.
 
 ## License
 
 MIT, see [LICENSE](LICENSE). MinHook, the Ultimate ASI Loader and NVIDIA's
-DLSS runtime keep their own licenses ([third_party/](third_party/)), which
-are included in the release archives.
+DLSS and Streamline runtimes keep their own licenses
+([third_party/](third_party/)), which are included in the release
+archives.

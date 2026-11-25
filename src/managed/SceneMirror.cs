@@ -89,6 +89,17 @@ namespace SpaceEngineers.RTHWAccel
             public bool MetalnessColorable;
         }
         internal delegate void InstanceReader(object instance, ref InstanceState state);
+        // A GeometryStage2 LOD part (MyPreprocessedPart, a struct) read in place from its LOD's GBufferParts:
+        // through IList every read boxed it.
+        internal struct PartState
+        {
+            public int Technique;
+            public int IndexCount;
+            public int IndexStart;
+            public int MaterialOffset;  // InstanceMaterialOffsetWithinLod (-1: the defaults)
+        }
+        internal delegate void PartReader(object parts, int index, ref PartState state);
+        private static PartReader s_readPart;  // (List<MyPreprocessedPart>, i, ref state)
         private static Func<object> s_instances;  // HashSet<MyInstance>
         private static InstanceReader s_readInstance;
         private static Func<object, bool> s_modelValid;
@@ -104,9 +115,9 @@ namespace SpaceEngineers.RTHWAccel
         private static Func<object, object[]> s_partTextures; // Material.Binding.Srvs: ColorMetal, NormalGloss, Extensions, Alphamask
         // The color multiplier and emissivity the game sets per object and material name
         // (MyRenderProxy.UpdateColorEmissivity: status lights, screens, lights switched off): a part's
-        // offset within its LOD (-1: the defaults), the LOD's offsets into the model's instance materials,
-        // an instance's value at a model offset (MyInstance.m_instanceMaterials, packed as half floats).
-        private static Func<object, int> s_partMaterialOffset;   // MyPreprocessedPart.InstanceMaterialOffsetWithinLod
+        // offset within its LOD (PartState.MaterialOffset; -1: the defaults), the LOD's offsets into the model's
+        // instance materials, an instance's value at a model offset (MyInstance.m_instanceMaterials, packed as
+        // half floats).
         private static Func<object, IList> s_lodMaterialOffsets; // MyLod.GetInstanceMaterialOffsets()
         private static Func<object, int, Vector4> s_instanceMaterial;
         // Skins on GeometryStage2 instances (armor panels, interior walls...: MyInstance.AddTextureChanges): the model
@@ -223,7 +234,13 @@ namespace SpaceEngineers.RTHWAccel
             public object Vb0;   // identity check: the game's vertex buffer object
             public int LastSeen;
             public int Validated;
+            public bool Released;  // replaced or evicted (Release): a worker's lookup of this frame may still hold it
             public uint[] Materials;                   // old-pipeline meshes: their parts' materials as registered
+            // Models: per registered part, its slot in the instances' materials (-1: the defaults), read from the
+            // LOD once per frame (RefreshPartSlots); AnyPartSlots: whether any part has one.
+            public int[] PartSlots;
+            public int PartCount;
+            public bool AnyPartSlots;
             public bool[] Hideable;                    // old-pipeline meshes: parts registered non-opaque (hideable)
             public bool Stale;                         // a part was hidden that is not: register anew
             public Dictionary<string, uint> Variants;  // other materials of the parts -> variant handle (0: refused)
@@ -437,7 +454,23 @@ namespace SpaceEngineers.RTHWAccel
             s_partDoubleSided = Expression.Lambda<Func<object, bool>>(Expression.ReferenceEqual(
                 Compiled.Member(Expression.Convert(boxedPart, part), "RasterizerState"), noCull), boxedPart).Compile();
             s_partTextures = Compiled.Getter<object[]>(part, "Material.Binding.Srvs");
-            s_partMaterialOffset = Compiled.Getter<int>(part, "InstanceMaterialOffsetWithinLod");
+            {
+                // (parts, i, ref state) => { var p = ((List<MyPreprocessedPart>)parts)[i]; state.Technique = ...; }
+                ParameterExpression parts = Expression.Parameter(typeof(object), "parts");
+                ParameterExpression i = Expression.Parameter(typeof(int), "i");
+                ParameterExpression state = Expression.Parameter(typeof(PartState).MakeByRefType(), "state");
+                ParameterExpression p = Expression.Variable(part, "p");
+                Expression Set(string field, Expression value) =>
+                    Expression.Assign(Expression.Field(state, field), Compiled.To<int>(value));
+                s_readPart = Expression.Lambda<PartReader>(Expression.Block(new[] { p },
+                    Expression.Assign(p, Expression.Property(
+                        Expression.Convert(parts, typeof(List<>).MakeGenericType(part)), "Item", i)),
+                    Set(nameof(PartState.Technique), Compiled.Path(p, "Material.Technique")),
+                    Set(nameof(PartState.IndexCount), Compiled.Member(p, "IndicesCount")),
+                    Set(nameof(PartState.IndexStart), Compiled.Member(p, "IndexStart")),
+                    Set(nameof(PartState.MaterialOffset), Compiled.Member(p, "InstanceMaterialOffsetWithinLod"))),
+                    parts, i, state).Compile();
+            }
             ParameterExpression boxedLod = Expression.Parameter(typeof(object), "o");
             s_lodMaterialOffsets = Expression.Lambda<Func<object, IList>>(Expression.Convert(Expression.Call(
                 Expression.Convert(boxedLod, lod), GameReflection.Method(lod, "GetInstanceMaterialOffsets")),
@@ -664,13 +697,78 @@ namespace SpaceEngineers.RTHWAccel
                     }
                 }
             }
+            long drawStart = Stopwatch.GetTimestamp();
             s_drawGameScene(renderTarget, ref debugAmbientOcclusion);
+            long drawTicks = Stopwatch.GetTimestamp() - drawStart;
+            s_drawTicks += drawTicks;
+            if (drawTicks > s_drawMaxTicks)
+                s_drawMaxTicks = drawTicks;
+            // The finished scene before the HUD: frame generation's HUD-less frame (nothing without it).
+            NativeApi.RtCaptureHudless();
         }
+
+        // The game's DrawGameScene per frame (Stopwatch ticks over the report window; the gate runs inside it).
+        private static long s_drawTicks;
+        private static long s_drawMaxTicks;
+
+        // The walk's CPU time by phase (Stopwatch ticks, sums over the report window; Report): model instances,
+        // renderables, voxel cells, the native submits, lamps, decals, the rest (environment, eviction).
+        private static readonly long[] s_phaseTicks = new long[7];
+        private static long s_modelVisits;       // GeometryStage2 instances walked (sums)
+        private static long s_renderableVisits;  // old-pipeline renderables walked (sums)
+        // The model instances' and renderables' walks by step (Stopwatch ticks, sums): their objects listed, read (on
+        // the walk's workers and the render thread), resolved and added (the render thread).
+        private static readonly string[] Steps =
+        {
+            "model instances: listing", "reading", "resolving and adding",
+            "renderables: listing", "reading", "resolving and adding",
+        };
+        private static readonly long[] s_stepTicks = new long[6];
+        private static int[] s_collections = new int[3];  // GC.CollectionCount per generation at the last report
+
+        // The frame's GeometryStage2 instances, listed from the game's active set in its order (s_modelList), and
+        // what the walk's workers read of each (ReadModels): the LOD drawn (null: left out), its index, the model
+        // instance it draws with if it has a skin, the LOD's mesh entry as known, its RtInstance but for the mesh and
+        // part overrides. ModelInstances then resolves and adds them in that order.
+        private struct ModelCandidate
+        {
+            public object Lod;
+            public object Own;
+            public MeshEntry Entry;
+            public int LodIndex;
+            public RtInstance Instance;
+        }
+        // The frame's old-pipeline renderables likewise (ReadRenderables): its LOD's proxies (null: left out), the
+        // first proxy's state, the material key of the proxies, a block bucket's instancing records, its placement and
+        // paint (an RtInstance but for the mesh, mask, flags and overrides).
+        private struct RenderableCandidate
+        {
+            public object[] Proxies;
+            public ProxyState Proxy;
+            public ulong MaterialKey;
+            public bool SkippedSkinned;  // skinned and instanced: left out
+            public byte[] InstancingData;
+            public int InstancingCount;
+            public int InstancingStride;
+            public RtInstance Instance;
+        }
+        // Whether this frame's objects are read on the walk's workers too; AlternateWalk ([Debug] WalkWorkers =
+        // alternate): by turns per report window, for comparisons.
+        private static bool s_parallel;
+        internal static bool AlternateWalk { get; set; }
+        private static FrameClock s_frameClock;  // the intervals between the walks' starts
+        private static object[] s_modelList = new object[4096];
+        private static ModelCandidate[] s_modelCandidates = new ModelCandidate[4096];
+        private static object[] s_renderableList = new object[4096];
+        private static RenderableCandidate[] s_renderableCandidates = new RenderableCandidate[4096];
+        private static readonly Action<int, int> s_readModels = ReadModels;
+        private static readonly Action<int, int> s_readRenderables = ReadRenderables;
 
         private static void Snapshot()
         {
             long start = Stopwatch.GetTimestamp();
             ++s_frame;
+            s_frameClock.Tick();
             s_lastSkinned = null;
             s_instanceCount = 0;
             s_bucketCount = 0;
@@ -679,24 +777,30 @@ namespace SpaceEngineers.RTHWAccel
             s_boneCount = 0;
             s_paletteCount = 0;
             long blocks = 0;
-
-            if (s_instances() is IEnumerable instances)
+            // The objects are read on the walk's workers too (by turns per report window with AlternateWalk).
+            s_parallel = WalkWorkers.Count > 0 && (!AlternateWalk || (s_frame - 1) / ReportFrames % 2 == 0);
+            if (s_parallel)
+                WalkWorkers.Begin();
+            long mark;
+            Dictionary<Type, MyRuntimeObjectsPool<MyActorComponent>> pools;
+            try
             {
-                foreach (object instance in instances)
-                    ModelInstance(instance);
+                if (s_instances() is IEnumerable instances)
+                    ModelInstances(instances);
+                mark = Stopwatch.GetTimestamp();
+                s_phaseTicks[0] += mark - start;
+                // The factory pools components by their exact type: voxel cells have
+                // their own pool (MyComponentFactory<MyVoxelCellComponent>), although
+                // their actors file them under the renderable slot.
+                pools = s_pools();
+                if (pools != null && pools.TryGetValue(s_renderableType, out MyRuntimeObjectsPool<MyActorComponent> renderables))
+                    blocks += Renderables(renderables);
             }
-            // The factory pools components by their exact type: voxel cells have
-            // their own pool (MyComponentFactory<MyVoxelCellComponent>), although
-            // their actors file them under the renderable slot.
-            Dictionary<Type, MyRuntimeObjectsPool<MyActorComponent>> pools = s_pools();
-            if (pools != null && pools.TryGetValue(s_renderableType, out MyRuntimeObjectsPool<MyActorComponent> renderables))
+            finally
             {
-                foreach (MyActorComponent component in renderables.Active)
-                {
-                    if (component.GetType() == s_renderableType)
-                        blocks += Renderable(component);
-                }
+                WalkWorkers.End();
             }
+            mark = PhaseLap(1, mark);
             if (pools != null && pools.TryGetValue(s_voxelCellType, out MyRuntimeObjectsPool<MyActorComponent> cells))
             {
                 bool any = false;
@@ -705,15 +809,20 @@ namespace SpaceEngineers.RTHWAccel
                 if (any)
                     VoxelMaterials();
             }
+            mark = PhaseLap(2, mark);
             NativeApi.RtSceneSubmit(s_frameInstances, s_instanceCount, s_frameBuckets, s_bucketCount, s_overrides,
                 s_overrideCount);
             NativeApi.RtSkinsSubmit(s_frameSkins, s_skinCount, s_bones, s_boneCount, s_palettes, s_paletteCount);
+            mark = PhaseLap(3, mark);
             LampMirror.Snapshot(pools);
+            mark = PhaseLap(4, mark);
             DecalMirror.Snapshot();
+            mark = PhaseLap(5, mark);
             SendEnvironment();
 
             if (s_frame % EvictAfterFrames == 0)
                 Evict();
+            PhaseLap(6, mark);
             long ticks = Stopwatch.GetTimestamp() - start;
             s_ticks += ticks;
             s_maxTicks = Math.Max(s_maxTicks, ticks);
@@ -726,69 +835,162 @@ namespace SpaceEngineers.RTHWAccel
                 Report();
         }
 
-        private static void ModelInstance(object instance)
+        // The time since `mark` to a phase; returns now.
+        private static long PhaseLap(int phase, long mark)
         {
-            var state = new InstanceState();
-            s_readInstance(instance, ref state);
-            if (state.Dummy || state.Model == null || state.ExplicitState == 2 || !(state.Owner is MyActorComponent owner))
-                return;
-            IMyActor actor = owner.Owner;
-            if (actor == null || actor.IsDestroyed || !actor.IsVisible)
-                return;
-            // A LOD of -1 is not drawn now (fading out, or never in view): a shadow caster only.
-            uint mask = (state.GBuffer && state.Lod >= 0 ? MaskPrimary : 0) | (state.Depth ? MaskShadow : 0);
-            if (mask == 0 || !s_modelValid(state.Model))
-                return;
-            IList lods = s_modelLods(state.Model);
-            if (lods == null || lods.Count == 0)
-                return;
-            int lodIndex = Math.Max(0, Math.Min(state.Lod, lods.Count - 1));
-            object lod = lods[lodIndex];
-            uint mesh = ModelMesh(lod);
-            if (mesh != 0)
+            long now = Stopwatch.GetTimestamp();
+            s_phaseTicks[phase] += now - mark;
+            return now;
+        }
+
+        // The time since `mark` to a step of the walks; returns now.
+        private static long StepLap(int step, long mark)
+        {
+            long now = Stopwatch.GetTimestamp();
+            s_stepTicks[step] += now - mark;
+            return now;
+        }
+
+        // The frame's model instances: listed, read on the walk's workers (ReadModels), then resolved (their meshes,
+        // skins and part overrides) and added in their order.
+        private static void ModelInstances(IEnumerable instances)
+        {
+            long mark = Stopwatch.GetTimestamp();
+            int count = 0;
+            foreach (object instance in instances)
             {
-                // A skin: the instance draws its own model instance's textures.
-                object own = s_skinnedModelInstance(instance);
-                if (own != null)
+                if (count == s_modelList.Length)
                 {
-                    mesh = SkinnedModelMesh(own, lodIndex, lod, mesh);
+                    Array.Resize(ref s_modelList, count * 2);
+                    Array.Resize(ref s_modelCandidates, count * 2);
+                }
+                s_modelList[count++] = instance;
+            }
+            s_modelVisits += count;
+            mark = StepLap(0, mark);
+            WalkWorkers.Run(count, s_readModels, s_parallel);
+            mark = StepLap(1, mark);
+            for (int i = 0; i < count; i++)
+            {
+                ref ModelCandidate candidate = ref s_modelCandidates[i];
+                if (candidate.Lod == null)
+                    continue;
+                // The entry the worker found serves once ModelMesh validated it this frame (for its LOD's first
+                // instance) and kept it.
+                MeshEntry entry = candidate.Entry;
+                uint mesh = entry != null && entry.Validated == s_frame && !entry.Released
+                    ? entry.Handle
+                    : ModelMesh(candidate.Lod, out entry);
+                if (mesh == 0)
+                    continue;
+                // A skin: the instance draws its own model instance's textures.
+                if (candidate.Own != null)
+                {
+                    mesh = SkinnedModelMesh(candidate.Own, candidate.LodIndex, candidate.Lod, mesh);
                     ++s_skinnedInstances;
                 }
+                uint overrides = ModelOverrides(s_modelList[i], entry);
+                if (s_instanceCount == s_frameInstances.Length)
+                    Array.Resize(ref s_frameInstances, s_frameInstances.Length * 2);
+                ref RtInstance added = ref s_frameInstances[s_instanceCount++];
+                added = candidate.Instance;
+                added.Mesh = mesh;
+                added.Overrides = overrides;
+            }
+            // The game's objects are not kept past the frame.
+            Array.Clear(s_modelList, 0, count);
+            Array.Clear(s_modelCandidates, 0, count);
+            StepLap(2, mark);
+        }
+
+        // The walk's workers (WalkWorkers): model instances [first, end) read into their candidates. Reads only: the
+        // game's objects, and the mesh entries by lookup (nothing changes s_modelMeshes meanwhile).
+        private static void ReadModels(int first, int end)
+        {
+            var state = new InstanceState();
+            for (int i = first; i < end; i++)
+            {
+                ref ModelCandidate candidate = ref s_modelCandidates[i];
+                candidate.Lod = null;
+                object instance = s_modelList[i];
+                s_readInstance(instance, ref state);
+                if (state.Dummy || state.Model == null || state.ExplicitState == 2 || !(state.Owner is MyActorComponent owner))
+                    continue;
+                IMyActor actor = owner.Owner;
+                if (actor == null || actor.IsDestroyed || !actor.IsVisible)
+                    continue;
+                // A LOD of -1 is not drawn now (fading out, or never in view): a shadow caster only.
+                uint mask = (state.GBuffer && state.Lod >= 0 ? MaskPrimary : 0) | (state.Depth ? MaskShadow : 0);
+                if (mask == 0 || !s_modelValid(state.Model))
+                    continue;
+                IList lods = s_modelLods(state.Model);
+                if (lods == null || lods.Count == 0)
+                    continue;
+                int lodIndex = Math.Max(0, Math.Min(state.Lod, lods.Count - 1));
+                object lod = lods[lodIndex];
+                if (lod == null)
+                    continue;
+                candidate.Lod = lod;
+                candidate.LodIndex = lodIndex;
+                s_modelMeshes.TryGetValue(lod, out candidate.Entry);
+                candidate.Own = s_skinnedModelInstance(instance);
                 Vector4 key = state.KeyColor.ToVector4();
-                AddInstance(mesh, mask, actor.ID, in actor.WorldMatrix, new Vector3(key.X, key.Y, key.Z),
-                    state.MetalnessColorable ? 1u : 0u, 0, ModelOverrides(instance, lod));
+                FillInstance(ref candidate.Instance, mask, actor.ID, in actor.WorldMatrix, new Vector3(key.X, key.Y, key.Z),
+                    state.MetalnessColorable ? 1u : 0u, 0);
             }
         }
 
         // The instance's color multiplier and emissivity per part its LOD's mesh was registered with
         // (ModelMesh's order), as the game's color prepare pass finds them (MyColorPreparePass0: a part's
         // offset within the LOD + 1, slot 0 the defaults): 0 when all are the defaults, else the
-        // RtInstance.Overrides of the entries added.
-        private static uint ModelOverrides(object instance, object lod)
+        // RtInstance.Overrides of the entries added. The parts' slots come from the LOD's mesh entry
+        // (RefreshPartSlots): a LOD without any costs its instances nothing.
+        private static uint ModelOverrides(object instance, MeshEntry entry)
         {
-            IList parts = s_lodGbufferParts(lod);
-            if (parts == null)
+            if (entry == null || !entry.AnyPartSlots)
                 return 0;
-            IList offsets = null;
+            int[] slots = entry.PartSlots;
             int start = s_overrideCount;
             bool any = false;
-            foreach (object part in parts)
+            for (int i = 0; i < entry.PartCount; i++)
             {
-                int technique = s_partTechnique(part);
-                if (Unmirrored(technique) || s_partIndexCount(part) <= 0 || s_partIndexStart(part) < 0)
-                    continue;  // not registered (ModelMesh, AddPart)
-                Vector4 value = Vector4.One;
-                int withinLod = s_partMaterialOffset(part);
-                if (withinLod >= 0)
-                {
-                    offsets = offsets ?? s_lodMaterialOffsets(lod);
-                    if (offsets != null && withinLod < offsets.Count)
-                        value = s_instanceMaterial(instance, (int)offsets[withinLod]);
-                }
+                Vector4 value = slots[i] >= 0 ? s_instanceMaterial(instance, slots[i]) : Vector4.One;
                 any |= value != Vector4.One;
                 AddOverride(value);
             }
             return EndOverrides(start, any);
+        }
+
+        // A model LOD's registered parts' slots in its instances' materials (the LOD's
+        // GetInstanceMaterialOffsets at the part's InstanceMaterialOffsetWithinLod; -1: the defaults), read once per
+        // frame for all the instances drawing the LOD.
+        private static void RefreshPartSlots(MeshEntry entry, object lod)
+        {
+            IList parts = s_lodGbufferParts(lod);
+            int count = parts?.Count ?? 0;
+            if (entry.PartSlots == null || entry.PartSlots.Length < count)
+                entry.PartSlots = new int[count];
+            IList offsets = null;
+            int registered = 0;
+            bool any = false;
+            var part = new PartState();
+            for (int i = 0; i < count; i++)
+            {
+                s_readPart(parts, i, ref part);
+                if (Unmirrored(part.Technique) || part.IndexCount <= 0 || part.IndexStart < 0)
+                    continue;  // not registered (ModelMesh, AddPart)
+                int slot = -1;
+                if (part.MaterialOffset >= 0)
+                {
+                    offsets = offsets ?? s_lodMaterialOffsets(lod);
+                    if (offsets != null && part.MaterialOffset < offsets.Count)
+                        slot = (int)offsets[part.MaterialOffset];
+                }
+                entry.PartSlots[registered++] = slot;
+                any |= slot >= 0;
+            }
+            entry.PartCount = registered;
+            entry.AnyPartSlots = any;
         }
 
         // The same for an old-pipeline renderable, from its registered proxies (LodMesh's order). A part the game
@@ -856,44 +1058,111 @@ namespace SpaceEngineers.RTHWAccel
             return (uint)start + 1;
         }
 
-        // Returns the number of cube blocks added.
-        private static int Renderable(MyActorComponent component)
+        // The frame's old-pipeline renderables (of the exact renderable type): listed, read on the walk's workers
+        // (ReadRenderables), then resolved and added in their order. Returns the number of cube blocks added.
+        private static long Renderables(MyRuntimeObjectsPool<MyActorComponent> pool)
         {
-            IMyActor actor = component.Owner;
-            if (actor == null || actor.IsDestroyed || !actor.IsVisible)
-                return 0;
-            var state = new RenderableState();
-            s_readRenderable(component, ref state);
-            if (!state.Standalone || !state.Built || state.Lods == null || state.Lods.Length == 0)
-                return 0;
-            object[] proxies = s_lodProxies(state.Lods[Math.Max(0, Math.Min(state.Lod, state.Lods.Length - 1))]);
-            if (proxies == null || proxies.Length == 0 || proxies[0] == null)
-                return 0;
-            var proxy = new ProxyState();
-            s_readProxy(proxies[0], ref proxy);
-            if (proxy.Skinned && proxy.Instancing >= 0 && proxy.InstanceCount > 0)
+            long mark = Stopwatch.GetTimestamp();
+            int count = 0;
+            foreach (MyActorComponent component in pool.Active)
             {
-                ++s_skippedSkinned;  // skinned and instanced: the game makes no such thing
-                return 0;
+                if (component.GetType() != s_renderableType)
+                    continue;
+                if (count == s_renderableList.Length)
+                {
+                    Array.Resize(ref s_renderableList, count * 2);
+                    Array.Resize(ref s_renderableCandidates, count * 2);
+                }
+                s_renderableList[count++] = component;
             }
+            s_renderableVisits += count;
+            mark = StepLap(3, mark);
+            WalkWorkers.Run(count, s_readRenderables, s_parallel);
+            mark = StepLap(4, mark);
+            long blocks = 0;
+            for (int i = 0; i < count; i++)
+                blocks += Renderable(s_renderableList[i], ref s_renderableCandidates[i]);
+            // The game's objects are not kept past the frame.
+            Array.Clear(s_renderableList, 0, count);
+            Array.Clear(s_renderableCandidates, 0, count);
+            StepLap(5, mark);
+            return blocks;
+        }
+
+        // The walk's workers (WalkWorkers): renderables [first, end) read into their candidates (reads only).
+        private static void ReadRenderables(int first, int end)
+        {
+            var state = new RenderableState();
+            for (int i = first; i < end; i++)
+            {
+                ref RenderableCandidate candidate = ref s_renderableCandidates[i];
+                candidate.Proxies = null;
+                candidate.SkippedSkinned = false;
+                candidate.InstancingData = null;
+                object component = s_renderableList[i];
+                IMyActor actor = ((MyActorComponent)component).Owner;
+                if (actor == null || actor.IsDestroyed || !actor.IsVisible)
+                    continue;
+                s_readRenderable(component, ref state);
+                if (!state.Standalone || !state.Built || state.Lods == null || state.Lods.Length == 0)
+                    continue;
+                object[] proxies = s_lodProxies(state.Lods[Math.Max(0, Math.Min(state.Lod, state.Lods.Length - 1))]);
+                if (proxies == null || proxies.Length == 0 || proxies[0] == null)
+                    continue;
+                s_readProxy(proxies[0], ref candidate.Proxy);
+                bool instanced = candidate.Proxy.Instancing >= 0 && candidate.Proxy.InstanceCount > 0;
+                if (candidate.Proxy.Skinned && instanced)
+                {
+                    candidate.SkippedSkinned = true;  // skinned and instanced: the game makes no such thing
+                    continue;
+                }
+                candidate.Proxies = proxies;
+                candidate.MaterialKey = MaterialKey(candidate.Proxy.Mesh, proxies);
+                if (instanced)
+                {
+                    candidate.InstancingData = s_instancingData(candidate.Proxy.Instancing);
+                    candidate.InstancingCount = s_instancingCount(candidate.Proxy.Instancing);
+                    candidate.InstancingStride = s_instancingStride(candidate.Proxy.Instancing);
+                }
+                FillInstance(ref candidate.Instance, 0, actor.ID, in actor.WorldMatrix, state.KeyColor, 0, 0);
+            }
+        }
+
+        // A renderable as read (ReadRenderables): its mesh and material variant resolved, added as a block bucket or
+        // an object. Returns the number of cube blocks added.
+        private static int Renderable(object component, ref RenderableCandidate candidate)
+        {
+            if (candidate.SkippedSkinned)
+                ++s_skippedSkinned;
+            object[] proxies = candidate.Proxies;
+            if (proxies == null)
+                return 0;
+            ref ProxyState proxy = ref candidate.Proxy;
             uint mesh = LodMesh(proxy.Mesh, proxies, voxel: false);
             if (mesh == 0)
                 return 0;
-            mesh = MaterialVariant(component, mesh, proxy.Mesh, proxies);
+            mesh = MaterialVariant(component, mesh, proxy.Mesh, proxies, candidate.MaterialKey);
             uint mask = (proxy.Flags & SkipInMainView) != 0 ? MaskShadow : MaskPrimary | MaskShadow;
             if (proxy.Instancing >= 0 && proxy.InstanceCount > 0)
             {
-                uint instancing = Instancing(proxy.Instancing);
+                uint instancing = Instancing(proxy.Instancing, candidate.InstancingData, candidate.InstancingCount,
+                    candidate.InstancingStride);
                 if (instancing == 0)
                     return 0;
-                AddBucket(mesh, instancing, proxy.StartInstance, proxy.InstanceCount, mask, in actor.WorldMatrix);
+                AddBucket(mesh, instancing, proxy.StartInstance, proxy.InstanceCount, mask, ref candidate.Instance);
                 return proxy.InstanceCount;
             }
             uint overrides = RenderableOverrides(proxy.Mesh, proxies, out bool visible, out bool hidden);
             if (visible || hidden)
                 mask = visible ? MaskPrimary | MaskShadow : MaskShadow;
-            AddInstance(mesh, mask, actor.ID, in actor.WorldMatrix, state.KeyColor, visible && hidden ? InstanceHiddenParts : 0,
-                0, overrides);
+            if (s_instanceCount == s_frameInstances.Length)
+                Array.Resize(ref s_frameInstances, s_frameInstances.Length * 2);
+            ref RtInstance added = ref s_frameInstances[s_instanceCount++];
+            added = candidate.Instance;
+            added.Mesh = mesh;
+            added.Mask = mask;
+            added.Flags = visible && hidden ? InstanceHiddenParts : 0;
+            added.Overrides = overrides;
             // A character: posed by the native core with this frame's bones; without any, left out rather than
             // drawn in its bind pose.
             if (proxy.Skinned && !AddSkin(proxy.Mesh, proxies))
@@ -1115,19 +1384,27 @@ namespace SpaceEngineers.RTHWAccel
             Log.Info($"Scene mirror: voxel material table sent ({count} entries).");
         }
 
-        // A GeometryStage2 LOD's mesh handle, registered on first use.
-        private static uint ModelMesh(object lod)
+        // A GeometryStage2 LOD's mesh handle, registered on first use; `found`: its entry (null while not loaded).
+        private static uint ModelMesh(object lod, out MeshEntry found)
         {
+            found = null;
             object vb0 = null;
             if (s_modelMeshes.TryGetValue(lod, out MeshEntry entry))
             {
                 entry.LastSeen = s_frame;
                 if (entry.Validated == s_frame)
+                {
+                    found = entry;
                     return entry.Handle;
+                }
                 entry.Validated = s_frame;
                 vb0 = s_lodVb0(lod);
                 if (ReferenceEquals(vb0, entry.Vb0))
+                {
+                    RefreshPartSlots(entry, lod);
+                    found = entry;
                     return entry.Handle;
+                }
                 Release(entry);
                 s_modelMeshes.Remove(lod);
             }
@@ -1171,7 +1448,9 @@ namespace SpaceEngineers.RTHWAccel
             };
             entry = Register(ref desc, partCount, vb0);
             entry.Materials = materials.ToArray();
+            RefreshPartSlots(entry, lod);
             s_modelMeshes[lod] = entry;
+            found = entry;
             return entry.Handle;
         }
 
@@ -1394,10 +1673,10 @@ namespace SpaceEngineers.RTHWAccel
         }
 
         // The handle for a renderable's own materials: its LOD mesh is shared by
-        // every renderable of the model, the materials (skins) are not.
-        private static uint MaterialVariant(object component, uint mesh, int meshIndex, object[] proxies)
+        // every renderable of the model, the materials (skins) are not. `key`:
+        // MaterialKey of the proxies.
+        private static uint MaterialVariant(object component, uint mesh, int meshIndex, object[] proxies, ulong key)
         {
-            ulong key = MaterialKey(meshIndex, proxies);
             if (!s_renderables.TryGetValue(component, out RenderableEntry cached))
             {
                 cached = new RenderableEntry();
@@ -1534,6 +1813,7 @@ namespace SpaceEngineers.RTHWAccel
 
         private static void Release(MeshEntry entry)
         {
+            entry.Released = true;
             if (entry.Variants != null)
             {
                 foreach (uint variant in entry.Variants.Values)
@@ -1551,12 +1831,9 @@ namespace SpaceEngineers.RTHWAccel
         }
 
         // The native handle of an instancing buffer's records (cube blocks: 64 bytes, generic instances: 32),
-        // uploaded again when the game changed them.
-        private static uint Instancing(int index)
+        // uploaded again when the game changed them; `data`, `count`, `stride`: the buffer's as read this frame.
+        private static uint Instancing(int index, byte[] data, int count, int stride)
         {
-            byte[] data = s_instancingData(index);
-            int count = s_instancingCount(index);
-            int stride = s_instancingStride(index);
             if (data == null || (stride != 64 && stride != 32))
                 return 0;
             count = Math.Min(count, data.Length / stride);
@@ -1584,11 +1861,20 @@ namespace SpaceEngineers.RTHWAccel
             if (s_instanceCount == s_frameInstances.Length)
                 Array.Resize(ref s_frameInstances, s_frameInstances.Length * 2);
             ref RtInstance instance = ref s_frameInstances[s_instanceCount++];
+            FillInstance(ref instance, mask, id, in world, keyColor, flags, keyW);
             instance.Mesh = mesh;
+            instance.Overrides = overrides;
+        }
+
+        // An instance at a world matrix, but for its mesh and part overrides (0).
+        private static void FillInstance(ref RtInstance instance, uint mask, uint id, in MatrixD world, Vector3 keyColor,
+            uint flags, float keyW)
+        {
+            instance.Mesh = 0;
             instance.Mask = mask;
             instance.Flags = flags;
             instance.Id = id;
-            instance.Overrides = overrides;
+            instance.Overrides = 0;
             instance.KeyColor[0] = keyColor.X;
             instance.KeyColor[1] = keyColor.Y;
             instance.KeyColor[2] = keyColor.Z;
@@ -1607,7 +1893,8 @@ namespace SpaceEngineers.RTHWAccel
             instance.Rotation[8] = (float)world.M33;
         }
 
-        private static void AddBucket(uint mesh, uint instancing, int start, int count, uint mask, in MatrixD world)
+        // A bucket of a renderable's blocks at the renderable's placement (`placement`'s translation and rotation).
+        private static void AddBucket(uint mesh, uint instancing, int start, int count, uint mask, ref RtInstance placement)
         {
             if (s_bucketCount == s_frameBuckets.Length)
                 Array.Resize(ref s_frameBuckets, s_frameBuckets.Length * 2);
@@ -1617,18 +1904,10 @@ namespace SpaceEngineers.RTHWAccel
             bucket.Start = (uint)Math.Max(0, start);
             bucket.Count = (uint)count;
             bucket.Mask = mask;
-            bucket.Translation[0] = world.M41;
-            bucket.Translation[1] = world.M42;
-            bucket.Translation[2] = world.M43;
-            bucket.Rotation[0] = (float)world.M11;
-            bucket.Rotation[1] = (float)world.M12;
-            bucket.Rotation[2] = (float)world.M13;
-            bucket.Rotation[3] = (float)world.M21;
-            bucket.Rotation[4] = (float)world.M22;
-            bucket.Rotation[5] = (float)world.M23;
-            bucket.Rotation[6] = (float)world.M31;
-            bucket.Rotation[7] = (float)world.M32;
-            bucket.Rotation[8] = (float)world.M33;
+            for (int i = 0; i < 3; i++)
+                bucket.Translation[i] = placement.Translation[i];
+            for (int i = 0; i < 9; i++)
+                bucket.Rotation[i] = placement.Rotation[i];
         }
 
         // Meshes and block records no object used for EvictAfterFrames frames.
@@ -1685,6 +1964,26 @@ namespace SpaceEngineers.RTHWAccel
                      $"registered anew for them), {s_skinnedInstances / frames:F0} model instances with a skin's textures " +
                      $"per frame ({s_skinnedModels.Count} skinned model instances known, {s_skinnedRebinds} LODs bound anew as textures " +
                      "streamed).");
+            string phases = string.Join(", ", new[] { "model instances", "renderables", "voxel cells", "native submits",
+                    "lamps", "decals", "the rest" }
+                .Select((name, i) => $"{name} {s_phaseTicks[i] * toMs / frames:F3}"));
+            string steps = string.Join(", ", Steps.Select((name, i) => $"{name} {s_stepTicks[i] * toMs / frames:F3}"));
+            // Garbage collections in the process this window (they pause every managed thread).
+            int[] collections = { GC.CollectionCount(0), GC.CollectionCount(1), GC.CollectionCount(2) };
+            string gcs = $"{collections[0] - s_collections[0]} gen0, {collections[1] - s_collections[1]} gen1, " +
+                         $"{collections[2] - s_collections[2]} gen2";
+            s_collections = collections;
+            string readers = s_parallel ? $"{WalkWorkers.Count} worker threads and the render thread" : "the render thread";
+            Log.Info($"Scene mirror: walk by phase per frame (ms): {phases}; {s_modelVisits / frames:F0} model instances and " +
+                     $"{s_renderableVisits / frames:F0} renderables walked, read on {readers}; by step: {steps}. Frames " +
+                     $"{s_frameClock.AverageMs:F2} ms apart on average; the game's DrawGameScene (the gate inside it) " +
+                     $"{s_drawTicks * toMs / Math.Max(1, s_frameClock.Count):F2} ms avg / {s_drawMaxTicks * toMs:F1} max. " +
+                     $"Garbage collections over the window: {gcs}.");
+            s_frameClock.Restart();
+            s_drawTicks = s_drawMaxTicks = 0;
+            Array.Clear(s_phaseTicks, 0, s_phaseTicks.Length);
+            Array.Clear(s_stepTicks, 0, s_stepTicks.Length);
+            s_modelVisits = s_renderableVisits = 0;
             s_ticks = s_maxTicks = s_instanceSum = s_bucketSum = s_blockSum = s_overriddenInstances = 0;
             s_hiddenPartInstances = s_reregistered = s_skinSum = s_skinBoneSum = s_skinnedInstances = 0;
             s_skinnedRebinds = 0;

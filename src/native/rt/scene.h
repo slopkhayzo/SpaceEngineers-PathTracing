@@ -251,6 +251,9 @@ struct SceneFrame {
 // shader-visible heap: the geometry pages' raw SRVs (ByteAddressBuffer[]).
 // `lampIntensity` scales the lamps' colours (the LampIntensity setting): their
 // traced light, the light list's weights and the grid's alike.
+// Any thread: the LampIntensity setting for the lamps uploaded from the next frame on.
+void SceneSetLampIntensity(float lampIntensity);
+
 [[nodiscard]] bool SceneInitialize(const Devices& devices, D3D12_CPU_DESCRIPTOR_HANDLE pageDescriptors,
                                    UINT descriptorSize, float lampIntensity);
 

@@ -939,6 +939,19 @@ MaterialError CompareMaterial(MaterialSample m, float4 rasterBase, float3 raster
     return e;
 }
 
+// --- The game's G-buffer ------------------------------------------------------
+
+// The G-buffer texel under a point of this pass's pixel grid (`pixel`: in its pixels, continuous). The pass traces
+// at the game's size, one texel per pixel, but for the lit view whose light Ray Reconstruction upscales from a
+// smaller size (DLSS modes: Width x Height against GBufferWidth x GBufferHeight).
+uint2 GBufferTexel(float2 pixel)
+{
+    float2 scale = float2(GBufferWidth, GBufferHeight) / float2(Width, Height);
+    return min(uint2(max(pixel * scale, 0)), uint2(GBufferWidth - 1, GBufferHeight - 1));
+}
+
+bool Upscaled() { return Width != GBufferWidth || Height != GBufferHeight; }
+
 // --- Probes -------------------------------------------------------------------
 
 uint ProbeAt(uint2 pixel)
@@ -1484,7 +1497,7 @@ float3 SampledLight(uint2 pixel, float3 surfacePoint, float3 previousPoint, floa
                 q = ((q + tileOffset) ^ 3) - tileOffset;
             if (any(q < 0) || q.x >= (int)Width || q.y >= (int)Height)
                 continue;
-            float stored = PreviousViewZ[q];
+            float stored = PreviousViewZ[GBufferTexel(q + 0.5)];
             if (!(stored > 0 && abs(stored - previousDepth) < 0.05 * previousDepth))
                 continue;
             uint4 kept = LightReservoirs[ReservoirIndex(1 - (LightSet & 1), uint2(q))];
@@ -1699,7 +1712,7 @@ bool ReprojectHistory(float3 previousPoint, out float4 diffuse, out float4 specu
         if (any(texel < 0) || texel.x >= (int)Width || texel.y >= (int)Height)
             continue;
         // With a perspective projection, clip.w is the view distance (PreviousViewZ's).
-        float stored = PreviousViewZ[texel];
+        float stored = PreviousViewZ[GBufferTexel(texel + 0.5)];
         if (!(stored > 0 && abs(clip.w - stored) < 0.02 * stored))
             continue;
         float4 d = PreviousDiffuse[texel];
@@ -1732,8 +1745,10 @@ void main(uint3 id : SV_DispatchThreadID)
         return;
     float2 uv = (id.xy + 0.5 + Jitter) / float2(Width, Height);
     float3 direction = mul(ScreenRay(uv), (float3x3)InvViewAt0);
-    // The ray cone: the pixel's angle, per unit of the ray parameter.
-    float coneSpread = 2 * ScreenRayTerms.y / Height * length(direction);
+    // The ray cone: the angle of the game's pixel, per unit of the ray parameter. Traced smaller (DLSS modes), the
+    // cone still takes the output's pixel: textures as sharp as the upscaled image shows them (DLSS's mip bias of
+    // log2(render / output)).
+    float coneSpread = 2 * ScreenRayTerms.y / GBufferHeight * length(direction);
 
     RayDesc ray;
     ray.Origin = 0;
@@ -1745,9 +1760,11 @@ void main(uint3 id : SV_DispatchThreadID)
 
     bool hit = query.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
     float rayZ = hit ? query.CommittedRayT() : 0;
-    float rasterZ = ViewZ[id.xy];
+    // The game's G-buffer under the ray's sample (the pixel itself at the game's size).
+    uint2 gbuffer = GBufferTexel(id.xy + 0.5 + Jitter);
+    float rasterZ = ViewZ[gbuffer];
     // Grass pixels (pack_gbuffer.hlsl) are left out of the comparison.
-    float rasterKind = NormalRoughness[id.xy].w;  // pack_gbuffer.hlsl: 1/3 grass, 2/3 emissive
+    float rasterKind = NormalRoughness[gbuffer].w;  // pack_gbuffer.hlsl: 1/3 grass, 2/3 emissive
     bool foliage = rasterZ > 0 && abs(rasterKind - 1.0 / 3) < 0.1;
     bool rasterEmissive = abs(rasterKind - 2.0 / 3) < 0.1;
     bool surface = rasterZ > 0 && !foliage;
@@ -1967,8 +1984,8 @@ void main(uint3 id : SV_DispatchThreadID)
         }
         // Compared where the ray found the game's surface, on textured meshes.
         bool compared = (fine || close) && s.hasAttributes && (kind != 2 || VoxelMaterialCount != 0);
-        float4 rasterBase = BaseColorMetalness[id.xy];
-        float4 rasterNormalRoughness = NormalRoughness[id.xy];
+        float4 rasterBase = BaseColorMetalness[gbuffer];
+        float4 rasterNormalRoughness = NormalRoughness[gbuffer];
         float3 rasterNormal = OctahedralDecode(rasterNormalRoughness.xy);
         MaterialError e = CompareMaterial(material, rasterBase, rasterNormal, rasterNormalRoughness.z);
         Count(16, compared);
@@ -2348,5 +2365,8 @@ void main(uint3 id : SV_DispatchThreadID)
             color = 0.15 * shade;
         }
     }
-    Output[id.xy] = float4(color, alpha);
+    // Traced smaller than the game's size (DLSS modes), the output is denoise.hlsl pass 3's: Ray
+    // Reconstruction's light, upscaled.
+    if (!Upscaled())
+        Output[id.xy] = float4(color, alpha);
 }

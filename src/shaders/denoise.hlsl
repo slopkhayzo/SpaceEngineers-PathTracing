@@ -19,7 +19,8 @@
 //     differences the variance does not explain; the specular light only
 //     while Step stays within its lobe (16 * roughness^2 pixels)
 //   2 compose: Output = albedo * (emission + diffuse) + specular
-//   3 Ray Reconstruction's output over the lit pixels (lit-rr view)
+//   3 Ray Reconstruction's output over the lit pixels (lit-rr view), over the output's size: Step and Source
+//     carry it (it is larger than Width x Height where Ray Reconstruction upscales, DLSS modes)
 // Filter alpha: the variance; -1 where the pixel is not lit (the game's own
 // light stays there).
 
@@ -275,10 +276,18 @@ void Atrous(int2 p)
                                                 : s;
 }
 
-// Ray Reconstruction's light on the lit pixels (the others keep the primary pass's alpha 0).
-void ComposeRayReconstruction(int2 p)
+// Ray Reconstruction's light on the lit pixels (the others keep the primary pass's alpha 0). Upscaled from a
+// smaller size, the primary pass wrote no output: every pixel here, lit where the game drew a surface other than
+// grass (what full coverage, the only coverage then, lights; primary_view.hlsl), the game's own light elsewhere.
+void ComposeRayReconstruction(int2 p, bool upscaled)
 {
-    if (RrColor[p].a > 0)
+    if (upscaled)
+    {
+        float viewZ = ViewZ[p];
+        bool grass = abs(NormalRoughness[p].w - 1.0 / 3) < 0.1;  // pack_gbuffer.hlsl
+        Output[p] = viewZ > 0 && !grass ? float4(RrOutput[p].rgb, 1) : float4(0, 0, 0, 0);
+    }
+    else if (RrColor[p].a > 0)
         Output[p] = float4(RrOutput[p].rgb, 1);
 }
 
@@ -296,7 +305,9 @@ void Compose(int2 p)
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID)
 {
-    if (id.x >= Width || id.y >= Height)
+    // Pass 3 runs over the output (its size in Step and Source), the others over the traced pixels.
+    uint2 size = Pass == 3 ? uint2(Step, Source) : uint2(Width, Height);
+    if (id.x >= size.x || id.y >= size.y)
         return;
     int2 p = int2(id.xy);
     if (Pass == 0)
@@ -306,5 +317,5 @@ void main(uint3 id : SV_DispatchThreadID)
     else if (Pass == 2)
         Compose(p);
     else
-        ComposeRayReconstruction(p);
+        ComposeRayReconstruction(p, size.x != Width || size.y != Height);
 }

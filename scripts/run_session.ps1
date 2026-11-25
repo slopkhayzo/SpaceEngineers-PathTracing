@@ -29,10 +29,11 @@ param(
     # [RayTracing] GateMode: off, roundtrip, overlay, replace.
     [ValidateSet('', 'off', 'roundtrip', 'overlay', 'replace')][string]$GateMode = '',
     # Shortcuts for the play profile: [RayTracing] DebugView (lit, lit-raw, ...),
-    # Denoiser, CharacterLights, LampIntensity and EmissiveIntensity (numbers,
-    # 0 to 100; empty: the INI's).
+    # Denoiser, DlssMode, CharacterLights, LampIntensity and EmissiveIntensity
+    # (numbers, 0 to 100; empty: the INI's).
     [string]$DebugView = '',
     [ValidateSet('', 'auto', 'rr', 'filter')][string]$Denoiser = '',
+    [ValidateSet('', 'dlaa', 'quality', 'balanced', 'performance', 'ultra-performance')][string]$DlssMode = '',
     [ValidateSet('', 'on', 'off')][string]$CharacterLights = '',
     [ValidateSet('', 'on', 'off')][string]$DecalLights = '',
     [string]$LampIntensity = '',
@@ -43,6 +44,8 @@ param(
     [switch]$FreeCamera,
     # [Debug] TestDecals: bullet holes where the player's view meets a grid, then views of them.
     [switch]$Decals,
+    # [Debug] TestMenu: the game's options screen and the plugin's Path tracing screen, with screenshots.
+    [switch]$Menu,
     # [Debug] LookAtSkins: views of the nearest block with each armor skin listed (comma-separated subtypes).
     [string]$Skins = '',
     # Also install the HighFPSFix release build (the sister repository's
@@ -77,9 +80,10 @@ if (-not $Loader) { $Loader = Join-Path $root 'research\loader\version.dll' }
 $bin = Join-Path $root "$BuildDir\bin"
 if ($PackageDir) {
     $bin = (Resolve-Path $PackageDir).Path
-    # The bundled loader: any DLL but the plugin's and DLSS Ray Reconstruction's runtime.
+    # The bundled loader: any DLL but the plugin's and NVIDIA's runtimes (DLSS's nvngx_*, Streamline's sl.*).
     $bundled = Get-ChildItem $bin -Filter '*.dll' |
-        Where-Object { $_.Name -notlike "$pluginName*" -and $_.Name -notlike 'nvngx_*' } | Select-Object -First 1
+        Where-Object { $_.Name -notlike "$pluginName*" -and $_.Name -notlike 'nvngx_*' -and $_.Name -notlike 'sl.*' } |
+        Select-Object -First 1
     if ($bundled) { $Loader = $bundled.FullName; $LoaderNames = @($bundled.Name) }
 }
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -168,10 +172,12 @@ $ini = Set-IniValue $ini 'Debug' 'CapturePath' (Join-Path $runDir 'captures')
 if ($Inspector) { $ini = Set-IniValue $ini 'Debug' 'InspectorSequence' 'true' }
 if ($FreeCamera) { $ini = Set-IniValue $ini 'Debug' 'FreeCamera' 'true' }
 if ($Decals) { $ini = Set-IniValue $ini 'Debug' 'TestDecals' 'true' }
+if ($Menu) { $ini = Set-IniValue $ini 'Debug' 'TestMenu' 'true' }
 if ($Skins) { $ini = Set-IniValue $ini 'Debug' 'LookAtSkins' $Skins }
 if ($GateMode) { $ini = Set-IniValue $ini 'RayTracing' 'GateMode' $GateMode }
 if ($DebugView) { $ini = Set-IniValue $ini 'RayTracing' 'DebugView' $DebugView }
 if ($Denoiser) { $ini = Set-IniValue $ini 'RayTracing' 'Denoiser' $Denoiser }
+if ($DlssMode) { $ini = Set-IniValue $ini 'RayTracing' 'DlssMode' $DlssMode }
 if ($CharacterLights) {
     $ini = Set-IniValue $ini 'RayTracing' 'CharacterLights' $(if ($CharacterLights -eq 'on') { 'true' } else { 'false' })
 }
@@ -232,17 +238,20 @@ try {
             Add-Installed $target; Copy-Item -Force $source $target
         }
     }
-    # DLSS Ray Reconstruction's runtime (builds with the DLSS SDK), next to the plugin; never over another copy.
-    $rrSource = Join-Path $bin 'nvngx_dlssd.dll'
-    if (Test-Path $rrSource) {
-        $rrTarget = Join-Path $GameBin64 'nvngx_dlssd.dll'
-        if (Test-Path $rrTarget) {
-            if ((Get-FileHash $rrTarget).Hash -ne (Get-FileHash $rrSource).Hash) {
-                throw "A different nvngx_dlssd.dll is already in $GameBin64; not replacing it."
+    # The NVIDIA runtimes the build ships next to the plugin (DLSS Ray Reconstruction with the DLSS SDK; Streamline
+    # and DLSS Frame Generation with the Streamline SDK); never over another copy.
+    foreach ($runtime in @('nvngx_dlssd.dll', 'sl.interposer.dll', 'sl.common.dll', 'sl.dlss_g.dll', 'sl.reflex.dll',
+                           'sl.pcl.dll', 'nvngx_dlssg.dll')) {
+        $runtimeSource = Join-Path $bin $runtime
+        if (-not (Test-Path $runtimeSource)) { continue }
+        $runtimeTarget = Join-Path $GameBin64 $runtime
+        if (Test-Path $runtimeTarget) {
+            if ((Get-FileHash $runtimeTarget).Hash -ne (Get-FileHash $runtimeSource).Hash) {
+                throw "A different $runtime is already in $GameBin64; not replacing it."
             }
-            Write-Step "nvngx_dlssd.dll (same file) already present; leaving it."
+            Write-Step "$runtime (same file) already present; leaving it."
         } else {
-            Add-Installed $rrTarget; Copy-Item $rrSource $rrTarget
+            Add-Installed $runtimeTarget; Copy-Item $runtimeSource $runtimeTarget
         }
     }
     $iniTarget = Join-Path $GameBin64 "$pluginName.ini"
@@ -276,6 +285,9 @@ try {
         if (Test-Path $path) { Remove-Item -Force $path }
         Add-Installed $path
     }
+    # Streamline's own logs (frame generation), written to the temp folder: this run's only.
+    $streamlineLogs = Join-Path $env:TEMP "$pluginName\streamline"
+    if (Test-Path $streamlineLogs) { Remove-Item -Recurse -Force $streamlineLogs }
 
     $steam = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -Name SteamExe).SteamExe
     Write-Step "Starting the game through Steam ($steam)."
@@ -333,6 +345,12 @@ finally {
     foreach ($log in @("$pluginName.log", "$pluginName.previous.log", "$highFpsName.log")) {
         $path = Join-Path $GameBin64 $log
         if (Test-Path $path) { Copy-Item $path (Join-Path $runDir $log) }
+    }
+    $streamlineLogs = Join-Path $env:TEMP "$pluginName\streamline"
+    if (Test-Path $streamlineLogs) {
+        $streamlineTarget = Join-Path $runDir 'streamline'
+        New-Item -ItemType Directory -Force $streamlineTarget | Out-Null
+        Get-ChildItem $streamlineLogs -File | ForEach-Object { Copy-Item $_.FullName $streamlineTarget }
     }
     Get-ChildItem $appData -Filter 'SpaceEngineers_*.log' -ErrorAction SilentlyContinue |
         Where-Object { $_.LastWriteTime -ge $started } | Sort-Object LastWriteTime | Select-Object -Last 1 |

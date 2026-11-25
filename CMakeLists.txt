@@ -74,6 +74,7 @@ sert_compute_shader(decode_positions src/shaders/decode_positions.hlsl cs_6_0 g_
 sert_compute_shader(expand_blocks src/shaders/expand_blocks.hlsl cs_6_0 g_expandBlocksCs)
 sert_compute_shader(skin_vertices src/shaders/skin_vertices.hlsl cs_6_0 g_skinVerticesCs)
 sert_compute_shader(primary_view src/shaders/primary_view.hlsl cs_6_5 g_primaryViewCs)
+sert_compute_shader(fg_ui src/shaders/fg_ui.hlsl cs_6_0 g_fgUiCs)
 sert_d3d11_compute_shader(pack_gbuffer src/shaders/pack_gbuffer.hlsl g_packGbufferCs)
 sert_d3d11_compute_shader(env_atlas src/shaders/env_atlas.hlsl g_envAtlasCs)
 add_custom_target(SpaceEngineersRTHWAccelShaders DEPENDS ${sert_shader_headers})
@@ -97,6 +98,9 @@ add_library(SpaceEngineersRTHWAccel MODULE
     src/native/native_api.cpp
     src/native/rt/common.cpp
     src/native/rt/dlss.cpp
+    src/native/rt/framegen.cpp
+    src/native/rt/presenter.cpp
+    src/native/rt/sampler.cpp
     src/native/rt/rt_core.cpp
     src/native/rt/scene.cpp
     src/native/rt/textures.cpp
@@ -153,6 +157,39 @@ else()
     message(STATUS "DLSS SDK not found (scripts/fetch_dlss.ps1): building without Ray Reconstruction")
     set(SERT_DLSS_FOUND FALSE)
     set(sert_dlss_package_args "")
+endif()
+
+# DLSS Frame Generation (optional): NVIDIA's Streamline SDK in third_party/streamline,
+# fetched by scripts/fetch_streamline.ps1 (third_party/streamline/UPSTREAM.md). Its
+# runtimes go next to the plugin; without them the plugin builds with frame generation
+# unavailable.
+set(SERT_STREAMLINE_DIR "${CMAKE_SOURCE_DIR}/third_party/streamline")
+set(SERT_STREAMLINE_RUNTIMES
+    sl.interposer.dll sl.common.dll sl.dlss_g.dll sl.reflex.dll sl.pcl.dll nvngx_dlssg.dll)
+set(SERT_STREAMLINE_FOUND TRUE)
+if(NOT EXISTS "${SERT_STREAMLINE_DIR}/include/sl.h")
+    set(SERT_STREAMLINE_FOUND FALSE)
+endif()
+foreach(runtime IN LISTS SERT_STREAMLINE_RUNTIMES)
+    if(NOT EXISTS "${SERT_STREAMLINE_DIR}/bin/x64/${runtime}")
+        set(SERT_STREAMLINE_FOUND FALSE)
+    endif()
+endforeach()
+set(sert_streamline_package_args "")
+if(SERT_STREAMLINE_FOUND)
+    message(STATUS "Streamline SDK found: building with DLSS Frame Generation")
+    set(sert_streamline_package_args "-DSTREAMLINE_DIR=${SERT_STREAMLINE_DIR}")
+    target_include_directories(SpaceEngineersRTHWAccel SYSTEM PRIVATE "${SERT_STREAMLINE_DIR}/include")
+    target_compile_definitions(SpaceEngineersRTHWAccel PRIVATE SERT_STREAMLINE=1)
+    foreach(runtime IN LISTS SERT_STREAMLINE_RUNTIMES)
+        add_custom_command(TARGET SpaceEngineersRTHWAccel POST_BUILD
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SERT_STREAMLINE_DIR}/bin/x64/${runtime}"
+                    "$<TARGET_FILE_DIR:SpaceEngineersRTHWAccel>/${runtime}"
+            VERBATIM
+        )
+    endforeach()
+else()
+    message(STATUS "Streamline SDK not found (scripts/fetch_streamline.ps1): building without frame generation")
 endif()
 set_target_properties(SpaceEngineersRTHWAccel PROPERTIES
     OUTPUT_NAME "${SERT_NAME}"
@@ -211,6 +248,7 @@ set(SERT_MANAGED_SOURCES
     src/managed/LightingHooks.cs
     src/managed/Log.cs
     src/managed/NativeApi.cs
+    src/managed/OptionsMenu.cs
     src/managed/PhotoControls.cs
     src/managed/Plugin.cs
     src/managed/RenderThread.cs
@@ -218,6 +256,7 @@ set(SERT_MANAGED_SOURCES
     src/managed/Settings.cs
     src/managed/ShaderPatch.cs
     src/managed/ShaderPatcher.cs
+    src/managed/WalkWorkers.cs
 )
 set(SERT_GAME_REFERENCES
     Sandbox.Common.dll
@@ -251,6 +290,8 @@ set(sert_rsp_lines
     "-reference:\"${SERT_NETFX_REFERENCE_DIR}/mscorlib.dll\""
     "-reference:\"${SERT_NETFX_REFERENCE_DIR}/System.dll\""
     "-reference:\"${SERT_NETFX_REFERENCE_DIR}/System.Core.dll\""
+    "-reference:\"${SERT_NETFX_REFERENCE_DIR}/System.Drawing.dll\""
+    "-reference:\"${SERT_NETFX_REFERENCE_DIR}/System.Windows.Forms.dll\""
 )
 file(GLOB sert_facades "${SERT_NETFX_REFERENCE_DIR}/Facades/*.dll")
 foreach(facade IN LISTS sert_facades)
@@ -299,6 +340,7 @@ set(SERT_TEST_SOURCES
     src/managed/NativeApi.cs
     src/managed/RenderThread.cs
     src/managed/SceneMirror.cs
+    src/managed/WalkWorkers.cs
 )
 set(SERT_TEST_GAME_REFERENCES
     SharpDX.dll
@@ -374,6 +416,7 @@ add_custom_target(package_plugin_only
             -DOUTPUT_DIR=${CMAKE_SOURCE_DIR}/dist/release/${SERT_NAME}-${PROJECT_VERSION}-plugin-only
             -DARCHIVE_FILE=${CMAKE_SOURCE_DIR}/dist/${SERT_NAME}-${PROJECT_VERSION}-plugin-only.zip
             ${sert_dlss_package_args}
+            ${sert_streamline_package_args}
             -P "${SERT_PACKAGE_SCRIPT}"
     DEPENDS SpaceEngineersRTHWAccel SpaceEngineersRTHWAccelManaged
     VERBATIM
@@ -396,6 +439,7 @@ if(SERT_ULTIMATE_ASI_LOADER_DLL AND EXISTS "${SERT_ULTIMATE_ASI_LOADER_DLL}")
                 -DOUTPUT_DIR=${CMAKE_SOURCE_DIR}/dist/release/${SERT_NAME}-${PROJECT_VERSION}-with-Ultimate-ASI-Loader
                 -DARCHIVE_FILE=${CMAKE_SOURCE_DIR}/dist/${SERT_NAME}-${PROJECT_VERSION}-with-Ultimate-ASI-Loader.zip
                 ${sert_dlss_package_args}
+                ${sert_streamline_package_args}
                 -P "${SERT_PACKAGE_SCRIPT}"
         DEPENDS SpaceEngineersRTHWAccel SpaceEngineersRTHWAccelManaged
         VERBATIM

@@ -39,6 +39,13 @@ namespace SpaceEngineers.RTHWAccel
         private static string s_folder;
         private static GateMode s_traced = GateMode.Replace;
 
+        // The traced mode the toggle key returns to, as the options screen last chose it.
+        internal static void SetTracedMode(GateMode mode)
+        {
+            if (mode != GateMode.Off)
+                s_traced = mode;
+        }
+
         [DllImport("user32.dll")]
         private static extern short GetAsyncKeyState(int virtualKey);
 

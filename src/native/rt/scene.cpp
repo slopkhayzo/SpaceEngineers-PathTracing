@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <iterator>
@@ -312,7 +313,44 @@ struct RetiredResource {
     UINT64 fence;
 };
 
+// SceneRecord's steps, timed on the CPU (SceneReport).
+enum ScenePhase : std::size_t {
+    kPhaseBuilds,       // BuildCopied: the BLAS of the meshes copied in
+    kPhaseVariants,     // PublishVariants
+    kPhaseSkins,        // PoseSkins
+    kPhaseRecords,      // UploadRecords
+    kPhaseBlockRecords, // UploadInstancings
+    kPhaseMaterials,    // UploadMaterials, UploadVoxelMaterials
+    kPhaseTlasObjects,  // BuildTopLevel: the objects' instance descs
+    kPhaseTlasBlocks,   // BuildTopLevel: the block buckets
+    kPhaseTlasBuild,    // BuildTopLevel: the rest (placements kept, the expansion and the build recorded)
+    kPhaseLamps,        // UploadLamps
+    kPhaseDecals,       // UploadDecals
+    kScenePhases
+};
+
+// Laps of the CPU clock: the time since the previous lap goes to a phase's sum (ms).
+struct Laps {
+    LARGE_INTEGER last{};
+    double toMs = 0.0;
+
+    Laps() {
+        LARGE_INTEGER frequency{};
+        QueryPerformanceFrequency(&frequency);
+        toMs = 1000.0 / static_cast<double>(frequency.QuadPart);
+        QueryPerformanceCounter(&last);
+    }
+
+    void To(double& sum) {
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        sum += static_cast<double>(now.QuadPart - last.QuadPart) * toMs;
+        last = now;
+    }
+};
+
 struct Stats {
+    std::array<double, kScenePhases> phaseMs{};  // sums over the frames
     std::array<UINT64, 3> registered{};  // by MeshKind
     UINT64 variants = 0;
     UINT64 built = 0;
@@ -327,7 +365,6 @@ struct Stats {
     UINT64 dropped = 0;
     UINT64 maxInstances = 0;
     UINT64 lamps = 0;  // sums over the frames
-    UINT64 sharedIds = 0;   // instances whose actor id an earlier instance of the frame had (sums)
     UINT64 sharedKeys = 0;  // instances whose actor and mesh an earlier instance had (sums)
     UINT64 skinsPosed = 0;  // sums over the frames
     UINT64 skinBones = 0;
@@ -360,6 +397,120 @@ struct Upload {
     }
 };
 
+// A map from 64-bit keys for the per-frame lookups of BuildTopLevel (the objects' and block buckets' placements
+// in the previous frame): open addressing with linear probing in flat arrays, emptied without freeing.
+// (std::unordered_map allocated and freed a node per entry and frame: tens of thousands per frame in large
+// worlds, about 2 ms of the render thread.)
+template <typename V>
+class FlatMap {
+public:
+    // Empties the map, sized so that `expected` entries fill at most half of it.
+    void Clear(const std::size_t expected) {
+        const std::size_t capacity = Capacity(expected);
+        if (keys_.size() != capacity) {
+            keys_.assign(capacity, kEmpty);
+            values_.assign(capacity, V{});
+        } else if (count_ != 0) {
+            std::fill(keys_.begin(), keys_.end(), kEmpty);
+        }
+        mask_ = capacity - 1;
+        count_ = 0;
+    }
+
+    const V* Find(const std::uint64_t key) const {
+        if (count_ == 0) {
+            return nullptr;
+        }
+        const std::uint64_t k = Normalize(key);
+        for (std::size_t i = Slot(k);; i = (i + 1) & mask_) {
+            if (keys_[i] == k) {
+                return &values_[i];
+            }
+            if (keys_[i] == kEmpty) {
+                return nullptr;
+            }
+        }
+    }
+
+    // The entry of `key`; a new one is value-initialized.
+    V& operator[](const std::uint64_t key) {
+        bool added = false;
+        return Insert(key, added);
+    }
+
+    // The entry of `key`, value-initialized if new (`added`).
+    V& Insert(const std::uint64_t key, bool& added) {
+        if ((count_ + 1) * 2 > keys_.size()) {
+            Grow();
+        }
+        const std::uint64_t k = Normalize(key);
+        for (std::size_t i = Slot(k);; i = (i + 1) & mask_) {
+            if (keys_[i] == k) {
+                added = false;
+                return values_[i];
+            }
+            if (keys_[i] == kEmpty) {
+                keys_[i] = k;
+                values_[i] = V{};
+                ++count_;
+                added = true;
+                return values_[i];
+            }
+        }
+    }
+
+    std::size_t size() const { return count_; }
+
+private:
+    static constexpr std::uint64_t kEmpty = ~0ull;
+
+    static std::size_t Capacity(const std::size_t expected) {
+        std::size_t capacity = 64;
+        while (capacity < expected * 2) {
+            capacity <<= 1;
+        }
+        return capacity;
+    }
+
+    // The empty marker is no key: such a key shares its neighbour's entry.
+    static std::uint64_t Normalize(const std::uint64_t key) { return key == kEmpty ? kEmpty - 1 : key; }
+
+    // MurmurHash3's 64-bit finalizer: actor ids and handles differ in few bits.
+    std::size_t Slot(std::uint64_t k) const {
+        k ^= k >> 33;
+        k *= 0xff51afd7ed558ccdull;
+        k ^= k >> 33;
+        k *= 0xc4ceb9fe1a85ec53ull;
+        k ^= k >> 33;
+        return static_cast<std::size_t>(k) & mask_;
+    }
+
+    void Grow() {
+        std::vector<std::uint64_t> keys = std::move(keys_);
+        std::vector<V> values = std::move(values_);
+        const std::size_t capacity = Capacity(std::max<std::size_t>(count_ + 1, keys.size()));
+        keys_.assign(capacity, kEmpty);
+        values_.assign(capacity, V{});
+        mask_ = capacity - 1;
+        for (std::size_t j = 0; j < keys.size(); ++j) {
+            if (keys[j] == kEmpty) {
+                continue;
+            }
+            std::size_t i = Slot(keys[j]);
+            while (keys_[i] != kEmpty) {
+                i = (i + 1) & mask_;
+            }
+            keys_[i] = keys[j];
+            values_[i] = values[j];
+        }
+    }
+
+    std::vector<std::uint64_t> keys_;
+    std::vector<V> values_;
+    std::size_t mask_ = 0;
+    std::size_t count_ = 0;
+};
+
 struct State {
     bool ready = false;
     SRWLOCK lock = SRWLOCK_INIT;
@@ -387,12 +538,10 @@ struct State {
         double translation[3];
         float rotation[9];
     };
-    std::unordered_map<std::uint64_t, Placement> placements;
-    std::unordered_map<std::uint64_t, Placement> nextPlacements;
-    std::unordered_map<std::uint64_t, std::uint32_t> occurrences;  // per frame: instances seen per actor and mesh
-    std::unordered_map<std::uint32_t, std::uint32_t> idOccurrences;  // per frame: instances seen per actor (statistics)
-    std::unordered_map<std::uint64_t, Placement> bucketPlacements;
-    std::unordered_map<std::uint64_t, Placement> nextBucketPlacements;
+    FlatMap<Placement> placements;
+    FlatMap<Placement> nextPlacements;
+    FlatMap<Placement> bucketPlacements;
+    FlatMap<Placement> nextBucketPlacements;
     ComPtr<ID3D12Resource> tlas;
     ComPtr<ID3D12Resource> tlasScratch;
     ComPtr<ID3D12RootSignature> decodeSignature;
@@ -417,7 +566,8 @@ struct State {
     bool scratchWritable = false;  // this gate's list put the scratch buffer into UNORDERED_ACCESS
     D3D12_CPU_DESCRIPTOR_HANDLE pageDescriptors{};
     UINT descriptorSize = 0;
-    float lampIntensity = 1.0f;  // Options::lampIntensity: the lamps' colours scaled as they are uploaded
+    // Options::lampIntensity (SceneSetLampIntensity): the lamps' colours scaled as they are uploaded.
+    std::atomic<float> lampIntensity{1.0f};
     // Materials: texture ids per slot (UINT32_MAX: the slot's default).
     struct Material {
         std::array<std::uint32_t, 4> textures{UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
@@ -1470,13 +1620,12 @@ bool EnsureTopLevel(const std::uint32_t count) {
 
 // A transform of the previous recorded frame (around `previousCamera`): the placement found for `key`
 // then, else the current one (at rest); this frame's placement is kept for the next.
-template <typename Key>
-void PreviousRows(std::unordered_map<Key, State::Placement>& before, std::unordered_map<Key, State::Placement>& after,
-                  const Key key, const bool keyed, const float rotation[9], const double translation[3],
-                  const double camera[3], const double* previousCamera, float rows[3][4]) {
-    const auto found = keyed && previousCamera != nullptr ? before.find(key) : before.end();
-    const bool known = found != before.end();
-    CameraRelativeRows(known ? found->second.rotation : rotation, known ? found->second.translation : translation,
+void PreviousRows(const FlatMap<State::Placement>& before, FlatMap<State::Placement>& after, const std::uint64_t key,
+                  const bool keyed, const float rotation[9], const double translation[3], const double camera[3],
+                  const double* previousCamera, float rows[3][4]) {
+    const State::Placement* found = keyed && previousCamera != nullptr ? before.Find(key) : nullptr;
+    CameraRelativeRows(found != nullptr ? found->rotation : rotation,
+                       found != nullptr ? found->translation : translation,
                        previousCamera != nullptr ? previousCamera : camera, rows);
     if (keyed) {
         State::Placement& placement = after[key];
@@ -1486,7 +1635,7 @@ void PreviousRows(std::unordered_map<Key, State::Placement>& before, std::unorde
 }
 
 SceneFrame BuildTopLevel(ID3D12GraphicsCommandList4* list, Upload& upload, const double camera[3],
-                         const double* previousCamera) {
+                         const double* previousCamera, Laps& laps) {
     SceneFrame frame;
     // Objects: instance descs written here.
     const UINT64 descsOffset =
@@ -1495,6 +1644,9 @@ SceneFrame BuildTopLevel(ID3D12GraphicsCommandList4* list, Upload& upload, const
     const UINT64 transformsOffset = upload.Allocate(s.instances.size() * kTransformBytes, 16);
     std::uint32_t cpuCount = 0;
     s.remapped.clear();
+    // This frame's placements, gathered anew (the previous frame's stay in s.placements and s.bucketPlacements).
+    s.nextPlacements.Clear(s.instances.size());
+    s.nextBucketPlacements.Clear(s.buckets.size());
     // The objects' part overrides, per record (scene_common.hlsli PartOverride): sized first, so that an
     // instance gets its slot only where its entries fit.
     std::size_t overrideRecords = 0;
@@ -1547,14 +1699,27 @@ SceneFrame BuildTopLevel(ID3D12GraphicsCommandList4* list, Upload& upload, const
             std::memcpy(upload.cpu + dataOffset + static_cast<UINT64>(cpuCount) * kInstanceDataStride, data,
                         sizeof(data));
             // Its transform in the previous recorded frame (moving grids, rotors, doors), found by a key that
-            // lasts from frame to frame: its actor and mesh, and its place among the instances with both.
+            // lasts from frame to frame: its actor and mesh, and its place among the instances with both (the n-th
+            // takes base ^ n * golden; the first of them not yet taken this frame).
             const std::uint64_t base = (static_cast<std::uint64_t>(instance.id) << 32) | instance.mesh;
-            const std::uint64_t occurrence = s.occurrences[base]++;
-            s.stats.sharedKeys += occurrence != 0 ? 1 : 0;
-            s.stats.sharedIds += s.idOccurrences[instance.id]++ != 0 ? 1 : 0;
+            std::uint64_t key = base;
+            State::Placement* placement = nullptr;
+            for (std::uint64_t occurrence = 0;; ++occurrence) {
+                key = base ^ (occurrence * 0x9E3779B97F4A7C15ull);
+                bool added = false;
+                placement = &s.nextPlacements.Insert(key, added);
+                if (added) {
+                    s.stats.sharedKeys += occurrence != 0 ? 1 : 0;
+                    break;
+                }
+            }
+            std::memcpy(placement->translation, instance.translation, sizeof(placement->translation));
+            std::memcpy(placement->rotation, instance.rotation, sizeof(placement->rotation));
+            const State::Placement* before = previousCamera != nullptr ? s.placements.Find(key) : nullptr;
             float previous[3][4];
-            PreviousRows(s.placements, s.nextPlacements, base ^ (occurrence * 0x9E3779B97F4A7C15ull), true,
-                         instance.rotation, instance.translation, camera, previousCamera, previous);
+            CameraRelativeRows(before != nullptr ? before->rotation : instance.rotation,
+                               before != nullptr ? before->translation : instance.translation,
+                               previousCamera != nullptr ? previousCamera : camera, previous);
             std::memcpy(upload.cpu + transformsOffset + static_cast<UINT64>(cpuCount) * kTransformBytes, previous,
                         sizeof(previous));
             ++cpuCount;
@@ -1568,6 +1733,7 @@ SceneFrame BuildTopLevel(ID3D12GraphicsCommandList4* list, Upload& upload, const
         const std::size_t floats = std::min(s.remapped.size(), std::max<std::size_t>(overrideRecords, 1) * 4);
         std::memcpy(upload.cpu + overridesOffset, s.remapped.data(), floats * sizeof(float));
     }
+    laps.To(s.stats.phaseMs[kPhaseTlasObjects]);
     // Cube blocks: one bucket per cell and model, expanded on the GPU.
     const UINT64 bucketsOffset = upload.Allocate(s.buckets.size() * sizeof(GpuBucket), 16);
     std::uint32_t bucketCount = 0;
@@ -1603,13 +1769,10 @@ SceneFrame BuildTopLevel(ID3D12GraphicsCommandList4* list, Upload& upload, const
             blockCount += gpu.blockCount;
         }
     }
+    laps.To(s.stats.phaseMs[kPhaseTlasBlocks]);
     // This frame's placements are the next frame's previous ones.
     std::swap(s.placements, s.nextPlacements);
-    s.nextPlacements.clear();
-    s.occurrences.clear();
-    s.idOccurrences.clear();
     std::swap(s.bucketPlacements, s.nextBucketPlacements);
-    s.nextBucketPlacements.clear();
     const std::uint32_t total = cpuCount + blockCount;
     if (!EnsureTopLevel(total)) {
         return frame;
@@ -1684,6 +1847,7 @@ SceneFrame BuildTopLevel(ID3D12GraphicsCommandList4* list, Upload& upload, const
                                                       : s.instanceData->GetGPUVirtualAddress();
     frame.materialCount = static_cast<std::uint32_t>(s.materialsWritten);
     frame.materialsVersion = s.materialsVersion;
+    laps.To(s.stats.phaseMs[kPhaseTlasBuild]);
     return frame;
 }
 
@@ -1729,7 +1893,7 @@ void UploadLamps(Upload& upload, const double camera[3], SceneFrame& frame, cons
             lamp.position[axis] = static_cast<float>(light.position[axis] - camera[axis]);
             const float beyond = std::max(std::abs(lamp.position[axis]) - kLightGridReach, 0.0f);
             outside += beyond * beyond;
-            lamp.color[axis] = light.color[axis] * s.lampIntensity;  // the LampIntensity setting
+            lamp.color[axis] = light.color[axis] * s.lampIntensity.load();  // the LampIntensity setting
             lamp.direction[axis] = light.direction[axis];
             lamp.up[axis] = light.up[axis];
         }
@@ -1989,7 +2153,7 @@ bool SceneInitialize(const Devices& devices, const D3D12_CPU_DESCRIPTOR_HANDLE p
     s.devices = devices;
     s.pageDescriptors = pageDescriptors;
     s.descriptorSize = descriptorSize;
-    s.lampIntensity = lampIntensity;
+    s.lampIntensity.store(lampIntensity);
     for (std::uint32_t page = 0; page < kMaxGeometryPages; ++page) {
         WritePageDescriptor(page, nullptr);
     }
@@ -2451,6 +2615,10 @@ void SceneSubmitLights(const RtLight* lights, const std::uint32_t count) {
     s.lights.assign(lights, lights + (lights != nullptr ? count : 0));
 }
 
+void SceneSetLampIntensity(const float lampIntensity) {
+    s.lampIntensity.store(lampIntensity);
+}
+
 void SceneSubmitDecals(const RtDecal* decals, const std::uint32_t count) {
     Exclusive lock;
     s.decals.assign(decals, decals + (decals != nullptr ? count : 0));
@@ -2524,17 +2692,27 @@ SceneFrame SceneRecord(ID3D12GraphicsCommandList4* list, const std::size_t slot,
     upload.cpu = s.uploadMapped + upload.base;
     upload.gpu = s.upload->GetGPUVirtualAddress() + upload.base;
     s.scratchWritable = false;
+    Laps laps;
+    std::array<double, kScenePhases>& ms = s.stats.phaseMs;
     BuildCopied(list);
+    laps.To(ms[kPhaseBuilds]);
     PublishVariants();
+    laps.To(ms[kPhaseVariants]);
     PoseSkins(list, upload);
+    laps.To(ms[kPhaseSkins]);
     UploadRecords(list, upload);
+    laps.To(ms[kPhaseRecords]);
     UploadInstancings(list, upload);
+    laps.To(ms[kPhaseBlockRecords]);
     UploadMaterials(list, upload);
     UploadVoxelMaterials(list, upload);
-    SceneFrame frame = BuildTopLevel(list, upload, camera, previousCamera);
+    laps.To(ms[kPhaseMaterials]);
+    SceneFrame frame = BuildTopLevel(list, upload, camera, previousCamera, laps);
     if (frame.tlas != 0) {
         UploadLamps(upload, camera, frame, allLamps);
+        laps.To(ms[kPhaseLamps]);
         UploadDecals(list, upload, camera, frame);
+        laps.To(ms[kPhaseDecals]);
     }
     ++s.stats.frames;
     return frame;
@@ -2586,7 +2764,7 @@ void SceneReport() {
                 L"registered (%llu models, %llu old-pipeline, %llu voxel cells), %llu variants, %llu built (%llu "
                 L"triangles), %llu failed, %llu released, "
                 L"%llu deferred; per frame %.0f instances + %.0f blocks (max %llu), %.0f not ready, %llu dropped, "
-                L"%.0f lamps, %.0f instances sharing an actor id (%.0f also the mesh); "
+                L"%.0f lamps, %.0f instances sharing an actor and mesh with another; "
                 L"geometry %llu MB in %zu pages, BLAS %llu MB in %zu pages, %llu records, block records %llu KB, "
                 L"TLAS capacity %u.",
                 live[static_cast<int>(MeshState::built)], live[static_cast<int>(MeshState::pending)],
@@ -2600,7 +2778,7 @@ void SceneReport() {
                 static_cast<double>(st.instances) / frames, static_cast<double>(st.blocks) / frames,
                 static_cast<unsigned long long>(st.maxInstances), static_cast<double>(st.notReady) / frames,
                 static_cast<unsigned long long>(st.dropped), static_cast<double>(st.lamps) / frames,
-                static_cast<double>(st.sharedIds) / frames, static_cast<double>(st.sharedKeys) / frames,
+                static_cast<double>(st.sharedKeys) / frames,
                 static_cast<unsigned long long>(geometryUsed >> 20),
                 s.geometryPages.size(), static_cast<unsigned long long>(blasUsed >> 20), s.blasPages.size(),
                 static_cast<unsigned long long>(s.recordAllocator.Used()),
@@ -2624,6 +2802,14 @@ void SceneReport() {
                     static_cast<double>(st.decalsSubmitted) / frames, static_cast<double>(st.decals) / frames,
                     static_cast<unsigned long long>(st.decalsDropped)));
     }
+    const auto& ms = st.phaseMs;
+    Info(Format(L"scene: CPU per frame (ms): BLAS builds %.3f, variants %.3f, skins %.3f, records %.3f, block records "
+                L"%.3f, materials %.3f, TLAS objects %.3f, TLAS block buckets %.3f, TLAS build %.3f, lamps %.3f, "
+                L"decals %.3f.",
+                ms[kPhaseBuilds] / frames, ms[kPhaseVariants] / frames, ms[kPhaseSkins] / frames,
+                ms[kPhaseRecords] / frames, ms[kPhaseBlockRecords] / frames, ms[kPhaseMaterials] / frames,
+                ms[kPhaseTlasObjects] / frames, ms[kPhaseTlasBlocks] / frames, ms[kPhaseTlasBuild] / frames,
+                ms[kPhaseLamps] / frames, ms[kPhaseDecals] / frames));
     st = Stats{};
 }
 

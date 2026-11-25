@@ -79,6 +79,34 @@ if(DEFINED DLSS_RUNTIME_FILE AND NOT DLSS_RUNTIME_FILE STREQUAL "")
     list(APPEND package_files nvngx_dlssd.dll NVIDIA-DLSS-LICENSE.txt)
 endif()
 
+# DLSS Frame Generation: NVIDIA Streamline's runtimes and NVIDIA's licences, when the build has the Streamline SDK
+# (third_party/streamline, scripts/fetch_streamline.ps1).
+if(DEFINED STREAMLINE_DIR AND NOT STREAMLINE_DIR STREQUAL "")
+    set(streamline_runtimes sl.interposer.dll sl.common.dll sl.dlss_g.dll sl.reflex.dll sl.pcl.dll nvngx_dlssg.dll)
+    set(streamline_licences
+        "license.txt|NVIDIA-STREAMLINE-LICENSE.txt"
+        "bin/x64/nvngx_dlss.license.txt|NVIDIA-DLSS-FRAME-GENERATION-LICENSE.txt"
+        "bin/x64/reflex.license.txt|NVIDIA-REFLEX-LICENSE.txt"
+        "3rd-party-licenses.md|NVIDIA-STREAMLINE-THIRD-PARTY-NOTICES.md")
+    foreach(runtime IN LISTS streamline_runtimes)
+        if(NOT EXISTS "${STREAMLINE_DIR}/bin/x64/${runtime}")
+            message(FATAL_ERROR "Streamline packaging input missing: ${STREAMLINE_DIR}/bin/x64/${runtime}")
+        endif()
+        file(COPY_FILE "${STREAMLINE_DIR}/bin/x64/${runtime}" "${OUTPUT_DIR}/${runtime}" ONLY_IF_DIFFERENT)
+        list(APPEND package_files "${runtime}")
+    endforeach()
+    foreach(licence IN LISTS streamline_licences)
+        string(REPLACE "|" ";" pair "${licence}")
+        list(GET pair 0 source)
+        list(GET pair 1 target)
+        if(NOT EXISTS "${STREAMLINE_DIR}/${source}")
+            message(FATAL_ERROR "Streamline packaging input missing: ${STREAMLINE_DIR}/${source}")
+        endif()
+        file(COPY_FILE "${STREAMLINE_DIR}/${source}" "${OUTPUT_DIR}/${target}" ONLY_IF_DIFFERENT)
+        list(APPEND package_files "${target}")
+    endforeach()
+endif()
+
 if(MODE STREQUAL "loader-bundled")
     file(COPY_FILE "${LOADER_FILE}" "${OUTPUT_DIR}/${LOADER_NAME}"
          ONLY_IF_DIFFERENT)

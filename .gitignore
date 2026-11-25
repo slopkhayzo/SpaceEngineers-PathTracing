@@ -11,3 +11,7 @@ __pycache__/
 # NVIDIA DLSS SDK files, fetched by scripts/fetch_dlss.ps1 (UPSTREAM.md records the version).
 /third_party/dlss/*
 !/third_party/dlss/UPSTREAM.md
+
+# NVIDIA Streamline SDK files, fetched by scripts/fetch_streamline.ps1 (UPSTREAM.md records the version).
+/third_party/streamline/*
+!/third_party/streamline/UPSTREAM.md

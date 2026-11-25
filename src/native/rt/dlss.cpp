@@ -12,9 +12,26 @@
 #include <nvsdk_ngx_params.h>
 #endif
 
+#include <algorithm>
+#include <cmath>
 #include <string>
 
 namespace sert::rt::dlss {
+
+const wchar_t* QualityName(const int quality) {
+    switch (quality) {
+    case 1:
+        return L"quality";
+    case 2:
+        return L"balanced";
+    case 3:
+        return L"performance";
+    case 4:
+        return L"ultra performance";
+    default:
+        return L"DLAA";
+    }
+}
 
 #if defined(SERT_DLSS)
 
@@ -29,11 +46,35 @@ struct State {
     ID3D12Device* device = nullptr;
     NVSDK_NGX_Parameter* parameters = nullptr;
     NVSDK_NGX_Handle* feature = nullptr;
-    unsigned width = 0;
+    unsigned width = 0;  // the feature's render and target sizes and mode
     unsigned height = 0;
+    unsigned targetWidth = 0;
+    unsigned targetHeight = 0;
+    int quality = 0;
     bool loggedEvaluateFailure = false;
+    // RenderSize's last answer.
+    unsigned sizeTargetWidth = 0;
+    unsigned sizeTargetHeight = 0;
+    int sizeQuality = -1;
+    unsigned sizeWidth = 0;
+    unsigned sizeHeight = 0;
 };
 State s;
+
+NVSDK_NGX_PerfQuality_Value QualityValue(const int quality) {
+    switch (quality) {
+    case 1:
+        return NVSDK_NGX_PerfQuality_Value_MaxQuality;
+    case 2:
+        return NVSDK_NGX_PerfQuality_Value_Balanced;
+    case 3:
+        return NVSDK_NGX_PerfQuality_Value_MaxPerf;
+    case 4:
+        return NVSDK_NGX_PerfQuality_Value_UltraPerformance;
+    default:
+        return NVSDK_NGX_PerfQuality_Value_DLAA;
+    }
+}
 
 void NVSDK_CONV LogCallback(const char* message, NVSDK_NGX_Logging_Level, NVSDK_NGX_Feature) {
     if (message == nullptr) {
@@ -108,11 +149,54 @@ bool Initialize(ID3D12Device* device, const wchar_t* runtimeDirectory, const wch
     return true;
 }
 
+void RenderSize(const unsigned targetWidth, const unsigned targetHeight, const int quality, unsigned& width,
+                unsigned& height) {
+    width = targetWidth;
+    height = targetHeight;
+    if (!s.available || quality <= 0 || quality > 4 || targetWidth == 0 || targetHeight == 0) {
+        return;
+    }
+    if (s.sizeTargetWidth == targetWidth && s.sizeTargetHeight == targetHeight && s.sizeQuality == quality) {
+        width = s.sizeWidth;
+        height = s.sizeHeight;
+        return;
+    }
+    unsigned optimalWidth = 0;
+    unsigned optimalHeight = 0;
+    unsigned maxWidth = 0;
+    unsigned maxHeight = 0;
+    unsigned minWidth = 0;
+    unsigned minHeight = 0;
+    float sharpness = 0.0f;
+    const NVSDK_NGX_Result result =
+        NGX_DLSSD_GET_OPTIMAL_SETTINGS(s.parameters, targetWidth, targetHeight, QualityValue(quality), &optimalWidth,
+                                       &optimalHeight, &maxWidth, &maxHeight, &minWidth, &minHeight, &sharpness);
+    if (NVSDK_NGX_FAILED(result) || optimalWidth == 0 || optimalHeight == 0 || optimalWidth > targetWidth ||
+        optimalHeight > targetHeight) {
+        // NVIDIA's published scale factors per axis.
+        static constexpr double kScale[5] = {1.0, 2.0 / 3.0, 0.58, 0.5, 1.0 / 3.0};
+        optimalWidth = std::max(1u, static_cast<unsigned>(std::lround(targetWidth * kScale[quality])));
+        optimalHeight = std::max(1u, static_cast<unsigned>(std::lround(targetHeight * kScale[quality])));
+        Info(Format(L"DLSS: no optimal render size from NGX for %s at %ux%u (%s); %ux%u by NVIDIA's scale.",
+                    QualityName(quality), targetWidth, targetHeight, ResultName(result), optimalWidth,
+                    optimalHeight));
+    }
+    s.sizeTargetWidth = targetWidth;
+    s.sizeTargetHeight = targetHeight;
+    s.sizeQuality = quality;
+    s.sizeWidth = optimalWidth;
+    s.sizeHeight = optimalHeight;
+    width = optimalWidth;
+    height = optimalHeight;
+}
+
 bool Evaluate(ID3D12GraphicsCommandList* list, const Inputs& in) {
-    if (!s.available || list == nullptr || in.width == 0 || in.height == 0) {
+    if (!s.available || list == nullptr || in.width == 0 || in.height == 0 || in.targetWidth < in.width ||
+        in.targetHeight < in.height) {
         return false;
     }
-    if (s.feature == nullptr || s.width != in.width || s.height != in.height) {
+    if (s.feature == nullptr || s.width != in.width || s.height != in.height || s.targetWidth != in.targetWidth ||
+        s.targetHeight != in.targetHeight || s.quality != in.quality) {
         if (s.feature != nullptr) {
             NVSDK_NGX_D3D12_ReleaseFeature(s.feature);  // the GPU is past it: the frames before are complete
             s.feature = nullptr;
@@ -123,24 +207,29 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const Inputs& in) {
         create.InUseHWDepth = NVSDK_NGX_DLSS_Depth_Type_Linear;
         create.InWidth = in.width;
         create.InHeight = in.height;
-        create.InTargetWidth = in.width;
-        create.InTargetHeight = in.height;
-        create.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_DLAA;
+        create.InTargetWidth = in.targetWidth;
+        create.InTargetHeight = in.targetHeight;
+        create.InPerfQualityValue = QualityValue(in.quality);
         create.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
                                       NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
         create.InEnableOutputSubrects = false;
         const NVSDK_NGX_Result result = NGX_D3D12_CREATE_DLSSD_EXT(list, 1, 1, &s.feature, s.parameters, &create);
         if (NVSDK_NGX_FAILED(result) || s.feature == nullptr) {
-            Error(Format(L"DLSS: Ray Reconstruction could not be created at %ux%u (%s); it stays off.", in.width,
-                         in.height, ResultName(result)));
+            Error(Format(L"DLSS: Ray Reconstruction could not be created at %ux%u to %ux%u (%s, %s); it stays off.",
+                         in.width, in.height, in.targetWidth, in.targetHeight, QualityName(in.quality),
+                         ResultName(result)));
             s.feature = nullptr;
             s.available = false;
             return false;
         }
         s.width = in.width;
         s.height = in.height;
-        Info(Format(L"DLSS: Ray Reconstruction created at %ux%u (DLAA, linear depth, roughness in the normals' w).",
-                    in.width, in.height));
+        s.targetWidth = in.targetWidth;
+        s.targetHeight = in.targetHeight;
+        s.quality = in.quality;
+        Info(Format(L"DLSS: Ray Reconstruction created: traced at %ux%u, out at %ux%u (%s; linear depth, roughness "
+                    L"in the normals' w).",
+                    in.width, in.height, in.targetWidth, in.targetHeight, QualityName(in.quality)));
         return false;  // evaluated from the next frame on
     }
     NVSDK_NGX_D3D12_DLSSD_Eval_Params eval{};
@@ -182,6 +271,11 @@ bool Built() {
 
 bool Initialize(ID3D12Device*, const wchar_t*, const wchar_t*) {
     return false;
+}
+
+void RenderSize(const unsigned targetWidth, const unsigned targetHeight, int, unsigned& width, unsigned& height) {
+    width = targetWidth;
+    height = targetHeight;
 }
 
 bool Evaluate(ID3D12GraphicsCommandList*, const Inputs&) {

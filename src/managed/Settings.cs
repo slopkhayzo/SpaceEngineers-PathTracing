@@ -7,6 +7,9 @@ namespace SpaceEngineers.RTHWAccel
 {
     internal sealed class Settings
     {
+        // The INI the settings came from (empty: the defaults); the options screen writes its settings back to it.
+        public string Path = "";
+
         // [General]
         public bool Enabled = true;
         public bool Diagnostics;
@@ -34,6 +37,9 @@ namespace SpaceEngineers.RTHWAccel
         // Lamps and emitters traced at any distance (the light grid's coarse levels beyond its fine one, filled
         // from the light tree), else 32 m around the camera, beyond which the game's own lamp light takes over.
         public bool LightTree = true;
+        // The DLSS mode of Ray Reconstruction: dlaa (the light traced at the game's resolution), quality, balanced,
+        // performance, ultra-performance (traced smaller, upscaled by Ray Reconstruction).
+        public DlssMode DlssMode = DlssMode.Dlaa;
         // Multipliers of the lamps' light (traced, and the game's own beyond the traced area) and of the light
         // emissive surfaces cast (not their own glow); 1 = as the game sets them.
         public float LampIntensity = 1f;
@@ -56,11 +62,46 @@ namespace SpaceEngineers.RTHWAccel
         // After the inspector (if any): bullet holes where the player's view meets a grid, and views of them
         // (DebugAutomation.DecalSequence).
         public bool TestDecals;
+        // After the other sequences: the game's options screen and the plugin's "Path tracing" screen opened, with
+        // screenshots that include them, the DLSS mode changed through the screen's drop-down (OptionsMenu).
+        public bool TestMenu;
         // Then, per armor skin listed (comma-separated subtypes; "block:<subtype>" for a block type): views of the
         // nearest block with it (DebugAutomation.SkinSequence).
         public string LookAtSkins = "";
         // The transparent pass's parts (glass, holograms, shields) mirrored as opaque surfaces, as before P2r (A/B).
         public bool MirrorTransparent;
+        // Who presents the game's frames: game (its own D3D11 swap chain) or d3d12 (the native core's D3D12 swap
+        // chain on the game's window, the base of frame generation; for tests while frame generation is built).
+        public string Presenter = "game";
+        // DLSS Frame Generation, the player's switch ([RayTracing] FrameGeneration, the Path tracing screen).
+        public bool FrameGenerationOn;
+        // The presenter's mode at the start (from FrameGenerationOn, or [Debug] FrameGeneration for tests): off, on,
+        // streamline (presented through Streamline with DLSS-G off: the integration's check).
+        public string FrameGeneration = "off";
+        // Unattended runs: halfway through AutoQuitSeconds, the game window as Windows composes it saved to
+        // CapturePath (window-d3d12.png or window-game.png: what the presenter puts on screen).
+        public bool CaptureWindow;
+        // Unattended runs: the game window brought to the foreground once the world is ready (as when played;
+        // frame generation's check).
+        public bool Foreground;
+        // Frame generation's pacing checks: Reflex's frame limit (frames per second; 0: none) and our presents' sync
+        // interval (-1: the game's).
+        public float FrameLimit;
+        public int PresentSync = -1;
+        // Reflex's mode with frame generation: off, low (low latency: the default), boost; -1 unset.
+        public int FrameGenReflex = -1;
+        // The native thread sampler: where the render thread, the game window's thread and the present thread spend
+        // their time, by module, every five seconds.
+        public bool SampleThreads;
+        // When the gate records its D3D12 commands (A/B of the render thread's time): after (the hand-off of the
+        // game's D3D11 work to D3D12), before (the driver submits the game's work meanwhile), alternate (by turns
+        // per report window). Empty: the native default.
+        public string HandOffOrder = "";
+        // Worker threads the scene walk reads the game's objects on besides the render thread (0: none, the walk
+        // on the render thread alone; -1: automatic, a quarter of the logical processors, at most 4).
+        public int WalkWorkers = -1;
+        // WalkWorkers = alternate: the automatic workers, used by turns per report window (comparisons).
+        public bool WalkAlternate;
         // The game's spectator camera (F8) in worlds this machine runs, also where the world does not allow it
         // (FreeCamera.cs), for screenshots.
         public bool FreeCamera;
@@ -77,6 +118,7 @@ namespace SpaceEngineers.RTHWAccel
         public static Settings Load(string path)
         {
             var settings = new Settings();
+            settings.Path = path ?? "";
             settings.Enabled = ReadBool(path, "General", "Enabled", settings.Enabled);
             settings.Diagnostics = ReadBool(path, "General", "Diagnostics", settings.Diagnostics);
             settings.GateMode = ReadGateMode(path, "RayTracing", "GateMode", settings.GateMode);
@@ -86,6 +128,7 @@ namespace SpaceEngineers.RTHWAccel
             settings.CharacterLights = ReadBool(path, "RayTracing", "CharacterLights", settings.CharacterLights);
             settings.DecalLights = ReadBool(path, "RayTracing", "DecalLights", settings.DecalLights);
             settings.LightTree = ReadBool(path, "RayTracing", "LightTree", settings.LightTree);
+            settings.DlssMode = ReadDlssMode(path, "RayTracing", "DlssMode", settings.DlssMode);
             settings.LampIntensity = ReadIntensity(path, "LampIntensity", settings.LampIntensity);
             settings.EmissiveIntensity = ReadIntensity(path, "EmissiveIntensity", settings.EmissiveIntensity);
             settings.PatchShaders = ReadBool(path, "RayTracing", "PatchShaders", settings.PatchShaders);
@@ -97,8 +140,27 @@ namespace SpaceEngineers.RTHWAccel
             settings.InspectorSequence = ReadBool(path, "Debug", "InspectorSequence", settings.InspectorSequence);
             settings.SeatInCockpit = ReadBool(path, "Debug", "SeatInCockpit", settings.SeatInCockpit);
             settings.TestDecals = ReadBool(path, "Debug", "TestDecals", settings.TestDecals);
+            settings.TestMenu = ReadBool(path, "Debug", "TestMenu", settings.TestMenu);
             settings.LookAtSkins = ReadString(path, "Debug", "LookAtSkins", settings.LookAtSkins);
             settings.MirrorTransparent = ReadBool(path, "Debug", "MirrorTransparent", settings.MirrorTransparent);
+            settings.HandOffOrder = ReadString(path, "Debug", "HandOffOrder", settings.HandOffOrder).ToLowerInvariant();
+            settings.Presenter = ReadString(path, "Debug", "Presenter", settings.Presenter).ToLowerInvariant();
+            settings.FrameGenerationOn = ReadBool(path, "RayTracing", "FrameGeneration", settings.FrameGenerationOn);
+            string frameGeneration = ReadString(path, "Debug", "FrameGeneration", "").ToLowerInvariant();
+            settings.FrameGeneration = frameGeneration.Length != 0 ? frameGeneration
+                                     : settings.FrameGenerationOn ? "on" : "off";
+            if (settings.FrameGeneration != "on" && settings.FrameGeneration != "streamline")
+                settings.FrameGeneration = "off";
+            settings.CaptureWindow = ReadBool(path, "Debug", "CaptureWindow", settings.CaptureWindow);
+            settings.Foreground = ReadBool(path, "Debug", "Foreground", settings.Foreground);
+            settings.FrameLimit = (float)ReadDouble(path, "Debug", "FrameLimit", settings.FrameLimit);
+            settings.PresentSync = (int)ReadDouble(path, "Debug", "PresentSync", settings.PresentSync);
+            string reflex = ReadString(path, "Debug", "FrameGenReflex", "").ToLowerInvariant();
+            settings.FrameGenReflex = reflex == "off" ? 0 : reflex == "low" ? 1 : reflex == "boost" ? 2 : -1;
+            settings.SampleThreads = ReadBool(path, "Debug", "SampleThreads", settings.SampleThreads);
+            string workers = ReadString(path, "Debug", "WalkWorkers", "");
+            settings.WalkWorkers = int.TryParse(workers, out int count) ? Math.Max(-1, Math.Min(count, 16)) : -1;
+            settings.WalkAlternate = workers.Equals("alternate", StringComparison.OrdinalIgnoreCase);
             settings.FreeCamera = ReadBool(path, "Debug", "FreeCamera", settings.FreeCamera);
             settings.ScreenshotKeyName = ReadString(path, "Debug", "ScreenshotKey", "");
             settings.ScreenshotKey = KeyCombo(settings.ScreenshotKeyName);
@@ -110,11 +172,50 @@ namespace SpaceEngineers.RTHWAccel
 
         public override string ToString() =>
             $"GateMode={GateMode}, DebugView={DebugView}, Denoiser={Denoiser}, CharacterLights={CharacterLights}, " +
-            $"DecalLights={DecalLights}, LightTree={LightTree}, " +
+            $"DecalLights={DecalLights}, LightTree={LightTree}, DlssMode={DlssMode}, " +
             $"LampIntensity={LampIntensity.ToString(CultureInfo.InvariantCulture)}, " +
             $"EmissiveIntensity={EmissiveIntensity.ToString(CultureInfo.InvariantCulture)}, " +
             $"PatternStrength={PatternStrength.ToString(CultureInfo.InvariantCulture)}, " +
             $"PatchShaders={PatchShaders}, SceneMirror={SceneMirror}";
+
+        // The settings of the options screen written back to the INI (each key in place, its comments kept). False
+        // when there is no INI or it cannot be written (a read-only game folder).
+        public bool SaveMenuSettings()
+        {
+            if (string.IsNullOrEmpty(Path))
+                return false;
+            var culture = CultureInfo.InvariantCulture;
+            bool ok = true;
+            ok &= Write("GateMode", GateMode == GateMode.Off ? "off" : GateMode == GateMode.Overlay ? "overlay"
+                                  : GateMode == GateMode.RoundTrip ? "roundtrip" : "replace");
+            ok &= Write("Denoiser", Denoiser == Denoiser.RayReconstruction ? "rr"
+                                  : Denoiser == Denoiser.Filter ? "filter" : "auto");
+            ok &= Write("DlssMode", DlssModeName(DlssMode));
+            ok &= Write("FrameGeneration", FrameGenerationOn ? "true" : "false");
+            ok &= Write("LightTree", LightTree ? "true" : "false");
+            ok &= Write("CharacterLights", CharacterLights ? "true" : "false");
+            ok &= Write("DecalLights", DecalLights ? "true" : "false");
+            ok &= Write("LampIntensity", LampIntensity.ToString("0.0#", culture));
+            ok &= Write("EmissiveIntensity", EmissiveIntensity.ToString("0.0#", culture));
+            return ok;
+
+            bool Write(string key, string value) => WritePrivateProfileStringW("RayTracing", key, " " + value, Path);
+        }
+
+        internal static string DlssModeName(DlssMode mode)
+        {
+            switch (mode)
+            {
+                case DlssMode.Quality: return "quality";
+                case DlssMode.Balanced: return "balanced";
+                case DlssMode.Performance: return "performance";
+                case DlssMode.UltraPerformance: return "ultra-performance";
+                default: return "dlaa";
+            }
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool WritePrivateProfileStringW(string section, string key, string value, string path);
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
         private static extern int GetPrivateProfileStringW(string section, string key, string fallback,
@@ -241,6 +342,22 @@ namespace SpaceEngineers.RTHWAccel
             }
             return pixels.ToArray();
         }
+
+        internal static DlssMode ParseDlssMode(string text, DlssMode fallback)
+        {
+            switch ((text ?? "").Trim().ToLowerInvariant().Replace(" ", "-").Replace("_", "-"))
+            {
+                case "dlaa": case "native": case "off": return DlssMode.Dlaa;
+                case "quality": return DlssMode.Quality;
+                case "balanced": return DlssMode.Balanced;
+                case "performance": return DlssMode.Performance;
+                case "ultra-performance": case "ultraperformance": return DlssMode.UltraPerformance;
+                default: return fallback;
+            }
+        }
+
+        private static DlssMode ReadDlssMode(string path, string section, string key, DlssMode fallback) =>
+            ParseDlssMode(ReadString(path, section, key, ""), fallback);
 
         private static Denoiser ReadDenoiser(string path, string section, string key, Denoiser fallback)
         {

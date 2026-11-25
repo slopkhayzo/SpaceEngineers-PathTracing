@@ -3,11 +3,14 @@
 #include "logger.h"
 #include "plugin_version.h"
 #include "rt/common.h"
+#include "rt/framegen.h"
 #include "rt/rt_core.h"
 #include "rt/scene.h"
 #include "rt/textures.h"
 
 #include <MinHook.h>
+
+#include <algorithm>
 
 namespace sert {
 namespace {
@@ -80,6 +83,7 @@ int __cdecl RtInitialize(void* d3d11Device, const RtOptions* options) {
         parsed.emissiveIntensity = options->emissiveIntensity;
         parsed.decalLights = options->decalLights != 0;
         parsed.lightTree = options->lightTree != 0;
+        parsed.dlssMode = static_cast<rt::DlssMode>(std::clamp(options->dlssMode, 0, 4));
         parsed.tracePath = options->tracePath != nullptr ? options->tracePath : L"";
         return rt::Initialize(static_cast<ID3D11Device*>(d3d11Device), parsed);
     } catch (...) {
@@ -262,6 +266,39 @@ void __cdecl RtSetLightTree(const int on) {
     rt::SetLightTree(on != 0);
 }
 
+void __cdecl RtSetDlssMode(const int mode) {
+    rt::SetDlssMode(static_cast<rt::DlssMode>(std::clamp(mode, 0, 4)));
+}
+
+void __cdecl RtSetOption(const int option, const float value) {
+    if (option >= 0 && option <= static_cast<int>(rt::Option::last)) {
+        rt::SetOption(static_cast<rt::Option>(option), value);
+    }
+}
+
+int __cdecl RtSetPresenter(void* swapChain, const int mode, void** window) {
+    return rt::SetPresenter(swapChain, mode, window) ? 0 : 1;
+}
+
+int __cdecl RtPresenterAttach() {
+    return rt::AttachPresenterWindow() ? 0 : 1;
+}
+
+void __cdecl RtCaptureHudless() {
+    rt::CaptureHudless();
+}
+
+int __cdecl RtFrameGenStatus(wchar_t* text, const int capacity) {
+    std::wstring reason;
+    const int status = rt::FrameGenStatus(reason);
+    if (text != nullptr && capacity > 0) {
+        const std::size_t count = std::min(reason.size(), static_cast<std::size_t>(capacity - 1));
+        std::copy_n(reason.data(), count, text);
+        text[count] = L'\0';
+    }
+    return status;
+}
+
 const NativeApi g_api{
     sizeof(NativeApi),
     SE_RTHWACCEL_API_VERSION,
@@ -294,6 +331,12 @@ const NativeApi g_api{
     &RtDecalsSubmit,
     &RtSetDecalLights,
     &RtSetLightTree,
+    &RtSetDlssMode,
+    &RtSetOption,
+    &RtSetPresenter,
+    &RtPresenterAttach,
+    &RtCaptureHudless,
+    &RtFrameGenStatus,
 };
 
 } // namespace

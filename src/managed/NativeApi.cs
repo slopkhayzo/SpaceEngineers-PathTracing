@@ -18,8 +18,8 @@ namespace SpaceEngineers.RTHWAccel
     // does not count those fields as blittable and may reorder them.
     internal static unsafe class NativeApi
     {
-        public const uint ExpectedVersion = 16;
-        public const uint ExpectedSize = 240;
+        public const uint ExpectedVersion = 19;
+        public const uint ExpectedSize = 288;
 
         // sert::RtOptions.
         [StructLayout(LayoutKind.Sequential)]
@@ -36,6 +36,7 @@ namespace SpaceEngineers.RTHWAccel
             public float EmissiveIntensity;  // the light emissive surfaces cast (not their own glow)
             public int DecalLights;          // 1: glowing decals are lights
             public int LightTree;            // 1: lamps and emitters traced at any distance (the light tree)
+            public int DlssMode;             // DlssMode: Ray Reconstruction's upscaling
         }
 
         private static delegate* unmanaged[Cdecl]<IntPtr, IntPtr, IntPtr*, int> s_createHook;
@@ -67,6 +68,12 @@ namespace SpaceEngineers.RTHWAccel
         private static delegate* unmanaged[Cdecl]<RtDecal*, uint, void> s_rtDecalsSubmit;
         private static delegate* unmanaged[Cdecl]<int, void> s_rtSetDecalLights;
         private static delegate* unmanaged[Cdecl]<int, void> s_rtSetLightTree;
+        private static delegate* unmanaged[Cdecl]<int, void> s_rtSetDlssMode;
+        private static delegate* unmanaged[Cdecl]<int, float, void> s_rtSetOption;
+        private static delegate* unmanaged[Cdecl]<IntPtr, int, IntPtr*, int> s_rtSetPresenter;
+        private static delegate* unmanaged[Cdecl]<int> s_rtPresenterAttach;
+        private static delegate* unmanaged[Cdecl]<void> s_rtCaptureHudless;
+        private static delegate* unmanaged[Cdecl]<char*, int, int> s_rtFrameGenStatus;
 
         public static bool IsBound => s_log != null;
 
@@ -124,6 +131,12 @@ namespace SpaceEngineers.RTHWAccel
             s_rtDecalsSubmit = (delegate* unmanaged[Cdecl]<RtDecal*, uint, void>)*(IntPtr*)(bytes + 216);
             s_rtSetDecalLights = (delegate* unmanaged[Cdecl]<int, void>)*(IntPtr*)(bytes + 224);
             s_rtSetLightTree = (delegate* unmanaged[Cdecl]<int, void>)*(IntPtr*)(bytes + 232);
+            s_rtSetDlssMode = (delegate* unmanaged[Cdecl]<int, void>)*(IntPtr*)(bytes + 240);
+            s_rtSetOption = (delegate* unmanaged[Cdecl]<int, float, void>)*(IntPtr*)(bytes + 248);
+            s_rtSetPresenter = (delegate* unmanaged[Cdecl]<IntPtr, int, IntPtr*, int>)*(IntPtr*)(bytes + 256);
+            s_rtPresenterAttach = (delegate* unmanaged[Cdecl]<int>)*(IntPtr*)(bytes + 264);
+            s_rtCaptureHudless = (delegate* unmanaged[Cdecl]<void>)*(IntPtr*)(bytes + 272);
+            s_rtFrameGenStatus = (delegate* unmanaged[Cdecl]<char*, int, int>)*(IntPtr*)(bytes + 280);
             return null;
         }
 
@@ -153,7 +166,7 @@ namespace SpaceEngineers.RTHWAccel
         // Returns 0, or the number of the RT core's step that failed (logged natively).
         public static int RtInitialize(IntPtr d3d11Device, GateMode gateMode, DebugView debugView, float patternStrength,
             string tracePath, Denoiser denoiser, bool characterLights, float lampIntensity, float emissiveIntensity,
-            bool decalLights, bool lightTree)
+            bool decalLights, bool lightTree, DlssMode dlssMode)
         {
             fixed (char* path = tracePath ?? "")
             {
@@ -170,6 +183,7 @@ namespace SpaceEngineers.RTHWAccel
                     EmissiveIntensity = emissiveIntensity,
                     DecalLights = decalLights ? 1 : 0,
                     LightTree = lightTree ? 1 : 0,
+                    DlssMode = (int)dlssMode,
                 };
                 CurrentGateMode = gateMode;
                 return s_rtInitialize(d3d11Device, &options);
@@ -340,6 +354,45 @@ namespace SpaceEngineers.RTHWAccel
         // from the light tree) or 32 m around the camera, from the next frame on (the LightTree setting; the
         // inspector's A/B); starts a fresh statistics window.
         public static void RtSetLightTree(bool on) => s_rtSetLightTree(on ? 1 : 0);
+
+        // The DLSS mode of Ray Reconstruction (the size the lit view's light is traced at, which Ray Reconstruction
+        // upscales to the game's), from the next frame on (the DlssMode setting; the inspector's A/B); starts a fresh
+        // statistics window.
+        public static void RtSetDlssMode(DlssMode mode) => s_rtSetDlssMode((int)mode);
+
+        // One of the settings the options screen changes while playing (rt::Option), from the next frame on; starts a
+        // fresh statistics window.
+        public static void RtSetOption(RtOption option, float value) => s_rtSetOption((int)option, value);
+
+        // The presenter on the game's swap chain (its IDXGISwapChain): `d3d12` its frames presented through the
+        // native core's D3D12 swap chain over the game's window, else the game's own; `window` the game's window.
+        // False when it could not be set.
+        // `mode`: 0 the game's, 1 ours, 2 ours through Streamline (DLSS Frame Generation off), 3 with DLSS-G on.
+        public static bool RtSetPresenter(IntPtr swapChain, int mode, out IntPtr window)
+        {
+            IntPtr result;
+            bool set = s_rtSetPresenter(swapChain, mode, &result) == 0;
+            window = result;
+            return set;
+        }
+
+        // On the thread of the game's window (the game's main thread): the presenter's window made over the game's
+        // client area; until then the game's swap chain presents. False when it could not be made.
+        public static bool RtPresenterAttach() => s_rtPresenterAttach() == 0;
+
+        // Render thread, once the game drew its scene (before its HUD): the frame copied for frame generation.
+        public static void RtCaptureHudless() => s_rtCaptureHudless();
+
+        // Whether frame generation can run: 0 yes, 1 not known yet (Streamline loads with the presenter), 2 no;
+        // `text` why not, or when it can, anything that hurts it (empty: nothing to say).
+        public static int RtFrameGenStatus(out string text)
+        {
+            const int capacity = 512;
+            char* buffer = stackalloc char[capacity];
+            int status = s_rtFrameGenStatus(buffer, capacity);
+            text = new string(buffer);
+            return status;
+        }
 
         // The projected decals of the next frame, in the game's draw order (copied by the native side).
         public static void RtDecalsSubmit(RtDecal[] decals, int count)
@@ -524,6 +577,31 @@ namespace SpaceEngineers.RTHWAccel
         Auto = 0,               // DLSS Ray Reconstruction where available (NVIDIA RTX), else our filter
         RayReconstruction = 1,  // DLSS Ray Reconstruction (our filter when it is unavailable)
         Filter = 2,             // our filter
+    }
+
+    // sert::rt::Option: the settings RtSetOption changes.
+    internal enum RtOption
+    {
+        Denoiser = 0,           // value: (int)Denoiser
+        CharacterLights = 1,    // 0 or 1
+        LampIntensity = 2,      // 0 to 100
+        EmissiveIntensity = 3,  // 0 to 100
+        HandOffOrder = 4,       // diagnostics: 0 D3D12 recorded after the hand-off, 1 before it, 2 by turns
+        FrameLimit = 5,         // frame generation: Reflex's frame limit (frames per second; 0: none)
+        PresentSync = 6,        // frame generation: our presents' sync interval (-1: the game's, 0, 1)
+        ReflexMode = 7,         // frame generation: Reflex's mode (0 off, 1 low latency: the default, 2 boost)
+        SampleThreads = 8,      // diagnostics: the thread sampler on (1) or off (0)
+    }
+
+    // sert::rt::DlssMode: the size Ray Reconstruction's light is traced at (it upscales to the game's). Only where Ray
+    // Reconstruction denoises the lit view in replace mode.
+    internal enum DlssMode
+    {
+        Dlaa = 0,              // the game's size
+        Quality = 1,           // about 67 % per axis
+        Balanced = 2,          // about 58 %
+        Performance = 3,       // 50 %
+        UltraPerformance = 4,  // about 33 %
     }
 
     // sert::rt::DebugView.

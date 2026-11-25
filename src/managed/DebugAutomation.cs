@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Threading;
 using Sandbox;
 using Sandbox.Engine.Utils;
@@ -39,6 +40,8 @@ namespace SpaceEngineers.RTHWAccel
                         Log.Info("Debug: world ready.");
                     // Let streaming settle (textures, voxel LODs) before measuring.
                     Thread.Sleep(TimeSpan.FromSeconds(10));
+                    if (settings.Foreground)
+                        BringToFront();
                     if (settings.SeatInCockpit)
                         SeatInCockpit();
                     if (settings.FreeCamera && settings.AutoQuitSeconds > 0)
@@ -53,10 +56,23 @@ namespace SpaceEngineers.RTHWAccel
                         DecalSequence(settings);
                     if (!string.IsNullOrWhiteSpace(settings.LookAtSkins))
                         SkinSequence(settings);
+                    if (settings.TestMenu)
+                        MenuSequence(settings);
                 }
                 if (settings.AutoQuitSeconds > 0)
                 {
-                    Thread.Sleep(TimeSpan.FromSeconds(settings.AutoQuitSeconds));
+                    if (settings.CaptureWindow)
+                    {
+                        // Halfway: the window as Windows shows it (the presenter's check).
+                        Thread.Sleep(TimeSpan.FromSeconds(settings.AutoQuitSeconds / 2));
+                        bool ours = settings.Presenter == "d3d12" || settings.FrameGeneration != "off";
+                        CaptureWindow(settings, ours ? "window-d3d12" : "window-game");
+                        Thread.Sleep(TimeSpan.FromSeconds(settings.AutoQuitSeconds / 2));
+                    }
+                    else
+                    {
+                        Thread.Sleep(TimeSpan.FromSeconds(settings.AutoQuitSeconds));
+                    }
                     Log.Info("Debug: quitting.");
                     NativeApi.RtShutdown();
                     MySandboxGame.ExitThreadSafe();
@@ -130,6 +146,21 @@ namespace SpaceEngineers.RTHWAccel
             NativeApi.RtSetLightTree(true);
             Step(GateMode.Replace, DebugView.Emitters, 8, "emitters-tree");
             NativeApi.RtSetLightTree(settings.LightTree);
+            // Ray Reconstruction's DLSS modes, A/B in the same view within the session: the light traced at the
+            // game's size (DLAA) and smaller, upscaled (the log's "DLSS Ray Reconstruction" line of each window
+            // names the mode and both sizes), then as the settings have it.
+            DlssMode[] dlssModes = { DlssMode.Dlaa, DlssMode.Quality, DlssMode.Balanced, DlssMode.Performance,
+                                     DlssMode.UltraPerformance };
+            for (int round = 0; round < 2; ++round)
+            {
+                foreach (DlssMode dlssMode in dlssModes)
+                {
+                    NativeApi.RtSetDlssMode(dlssMode);
+                    Step(GateMode.Replace, DebugView.Lit, 7,
+                         round == 0 ? "lit-replace-dlss-" + dlssMode.ToString().ToLowerInvariant() : null);
+                }
+            }
+            NativeApi.RtSetDlssMode(settings.DlssMode);
             // Emissive surfaces as lights alone (replace: without the game's local lights on top), then the same
             // without reusing light samples: the unbiased reference the reuse must match on average (the log's
             // sampled diffuse light, and the accumulated images).
@@ -920,6 +951,195 @@ namespace SpaceEngineers.RTHWAccel
         }
 
         // The game's own screenshot (no HUD), written by its render thread.
+        // [Debug] TestMenu: the game's graphics options with their "Path tracing" button, the plugin's screen over them,
+        // the DLSS mode changed through its drop-down (its event applies it as a click would) and back, frame generation
+        // switched; screenshots with the GUI.
+        private static void MenuSequence(Settings settings)
+        {
+            Sandbox.Graphics.GUI.MyGuiScreenBase options = null;
+            PathTracingScreen screen = null;
+            OnGameThread(() =>
+            {
+                options = OptionsMenu.CreateGraphicsOptionsScreen();
+                if (options != null)
+                    Sandbox.Graphics.GUI.MyGuiSandbox.AddScreen(options);
+            }, "the game's graphics options could not be opened");
+            if (options == null)
+                return;
+            Thread.Sleep(2000);
+            string button = "missing";
+            OnGameThread(() =>
+            {
+                foreach (Sandbox.Graphics.GUI.MyGuiControlBase control in options.Controls)
+                {
+                    if (control is Sandbox.Graphics.GUI.MyGuiControlButton found && found.Name == "PathTracing")
+                        button = $"\"{found.Text}\" at ({found.Position.X:F3}, {found.Position.Y:F3})";
+                }
+            }, "the graphics options' controls could not be read");
+            Log.Info($"Menu test: the graphics options' Path tracing button: {button}.");
+            CaptureGui(settings, "menu-graphics");
+            Thread.Sleep(1500);
+            OnGameThread(() =>
+            {
+                screen = new PathTracingScreen(settings);
+                Sandbox.Graphics.GUI.MyGuiSandbox.AddScreen(screen);
+            }, "the Path tracing screen could not be opened");
+            if (screen != null)
+            {
+                Thread.Sleep(2000);
+                CaptureGui(settings, "menu-path-tracing");
+                Thread.Sleep(1500);
+                DlssMode before = settings.DlssMode;
+                OnGameThread(() => screen.DlssModeCombobox.SelectItemByKey((long)DlssMode.Performance),
+                    "the DLSS mode could not be selected");
+                Thread.Sleep(4000);
+                CaptureGui(settings, "menu-dlss-performance");
+                Thread.Sleep(1500);
+                OnGameThread(() => screen.DlssModeCombobox.SelectItemByKey((long)before), "the DLSS mode could not be reset");
+                // Frame generation switched on as a click would (Streamline loads now when it did not at the start),
+                // then back to how it was.
+                bool frameGeneration = settings.FrameGenerationOn;
+                Thread.Sleep(1500);
+                OnGameThread(() => screen.FrameGenerationCheckbox.IsChecked = !frameGeneration,
+                    "frame generation could not be switched");
+                Log.Info($"Menu test: frame generation switched {(!frameGeneration ? "on" : "off")} " +
+                         $"({(settings.FrameGenerationOn != frameGeneration ? "taken" : "refused")}).");
+                Thread.Sleep(8000);
+                CaptureGui(settings, "menu-frame-generation");
+                OnGameThread(() => screen.FrameGenerationCheckbox.IsChecked = frameGeneration,
+                    "frame generation could not be switched back");
+                Thread.Sleep(3000);
+                OnGameThread(() => screen.CloseScreen(), "the Path tracing screen could not be closed");
+            }
+            OnGameThread(() => options.CloseScreen(), "the graphics options could not be closed");
+            Thread.Sleep(1500);
+            Log.Info("Menu test: done.");
+
+            void OnGameThread(Action action, string failure)
+            {
+                bool done = false;
+                MySandboxGame.Static.Invoke(() =>
+                {
+                    try
+                    {
+                        action();
+                    }
+                    catch (Exception exception)
+                    {
+                        Log.Error("Menu test: " + failure, exception);
+                    }
+                    finally
+                    {
+                        done = true;
+                    }
+                }, Plugin.Name);
+                Plugin.WaitUntil(() => done, TimeSpan.FromSeconds(10));
+            }
+        }
+
+        // A screenshot with the GUI drawn (the menu test's).
+        [DllImport("user32.dll")]
+        private static extern bool PrintWindow(IntPtr window, IntPtr dc, uint flags);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr window);
+
+        [DllImport("user32.dll")]
+        private static extern bool BringWindowToTop(IntPtr window);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr window, IntPtr processId);
+
+        [DllImport("user32.dll")]
+        private static extern bool AttachThreadInput(uint attach, uint attachTo, bool on);
+
+        [DllImport("kernel32.dll")]
+        private static extern uint GetCurrentThreadId();
+
+        // The game window in the foreground, as when played (Windows lets a thread set the foreground while its
+        // input is attached to the foreground window's thread).
+        private static void BringToFront()
+        {
+            IntPtr window = Process.GetCurrentProcess().MainWindowHandle;
+            IntPtr foreground = GetForegroundWindow();
+            if (window == IntPtr.Zero || window == foreground)
+            {
+                Log.Info(window == IntPtr.Zero ? "Debug: no game window to bring to the foreground."
+                                               : "Debug: the game window is in the foreground already.");
+                return;
+            }
+            uint own = GetCurrentThreadId();
+            uint other = foreground != IntPtr.Zero ? GetWindowThreadProcessId(foreground, IntPtr.Zero) : 0;
+            bool attached = other != 0 && other != own && AttachThreadInput(own, other, true);
+            BringWindowToTop(window);
+            bool set = SetForegroundWindow(window);
+            if (attached)
+                AttachThreadInput(own, other, false);
+            Log.Info($"Debug: the game window brought to the foreground ({(set ? "done" : "refused")}; now " +
+                     $"{(GetForegroundWindow() == window ? "the game's" : "another")}).");
+        }
+
+        [DllImport("user32.dll")]
+        private static extern bool GetClientRect(IntPtr window, out ClientRect rect);
+
+#pragma warning disable CS0649  // filled by GetClientRect
+        private struct ClientRect
+        {
+            public int Left, Top, Right, Bottom;
+        }
+#pragma warning restore CS0649
+
+        // The game window's client area as Windows composes it (PrintWindow with PW_RENDERFULLCONTENT: the DirectX
+        // content of flip-model swap chains included), to see what the presenter puts on screen.
+        private static void CaptureWindow(Settings settings, string name)
+        {
+            const uint clientOnly = 1, renderFullContent = 2;
+            if (string.IsNullOrEmpty(settings.CapturePath))
+                return;
+            IntPtr window = Process.GetCurrentProcess().MainWindowHandle;
+            if (window == IntPtr.Zero || !GetClientRect(window, out ClientRect rect) || rect.Right <= rect.Left ||
+                rect.Bottom <= rect.Top)
+            {
+                Log.Warning("Debug: no game window to capture.");
+                return;
+            }
+            int width = rect.Right - rect.Left, height = rect.Bottom - rect.Top;
+            using (var bitmap = new System.Drawing.Bitmap(width, height,
+                System.Drawing.Imaging.PixelFormat.Format32bppArgb))
+            {
+                bool printed;
+                using (System.Drawing.Graphics graphics = System.Drawing.Graphics.FromImage(bitmap))
+                {
+                    IntPtr dc = graphics.GetHdc();
+                    printed = PrintWindow(window, dc, clientOnly | renderFullContent);
+                    graphics.ReleaseHdc(dc);
+                }
+                if (!printed)
+                {
+                    Log.Warning("Debug: PrintWindow failed; no window capture.");
+                    return;
+                }
+                Directory.CreateDirectory(settings.CapturePath);
+                string path = Path.Combine(settings.CapturePath, name + ".png");
+                bitmap.Save(path, System.Drawing.Imaging.ImageFormat.Png);
+                Log.Info($"Debug: window captured ({width}x{height}) to {path}.");
+            }
+        }
+
+        private static void CaptureGui(Settings settings, string name)
+        {
+            if (string.IsNullOrEmpty(settings.CapturePath))
+                return;
+            Directory.CreateDirectory(settings.CapturePath);
+            string path = Path.Combine(settings.CapturePath, name + ".png");
+            MySandboxGame.Static.Invoke(() => MyRenderProxy.TakeScreenshot(Vector2.One, path, false, false, false),
+                Plugin.Name);
+            Log.Info("Menu test: screenshot requested: " + path);
+        }
+
         private static void Capture(Settings settings, string name)
         {
             if (string.IsNullOrEmpty(settings.CapturePath))
