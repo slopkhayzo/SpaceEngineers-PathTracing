@@ -10,7 +10,7 @@
 Path-traced lighting for *Space Engineers* (Steam, 64-bit), delivered as an
 ASI plugin like [SpaceEngineers.HighFPSFix](https://github.com/slopkhayzo/SpaceEngineers-HighFPS-RIL).
 
-**Status: 0.3.0.** The plugin replaces the game's lighting with light traced
+**Status: 0.4.0.** The plugin replaces the game's lighting with light traced
 by the GPU's ray-tracing hardware:
 - sunlight with soft shadows, and light from the sky;
 - the game's lamps, at any distance, with shadows;
@@ -23,8 +23,10 @@ keyholes), the decals the game projects onto blocks (bullet holes and the
 like) and the blocks' armor skins.
 
 The traced light is denoised by NVIDIA DLSS Ray Reconstruction on GeForce
-RTX GPUs, and by the plugin's own filter on other GPUs. NVIDIA DLSS Frame
-Generation is optional on GeForce RTX 40 and 50 series GPUs. The game still
+RTX GPUs (which can also upscale light traced at a lower resolution: the
+DLSS modes), and by the plugin's own filter on other GPUs. NVIDIA DLSS Frame
+Generation is optional on GeForce RTX 40 and 50 series GPUs. The main
+settings are in the game's Options > Graphics > Path tracing. The game still
 draws fog, atmosphere, transparent surfaces, particles, post-processing and
 the HUD.
 

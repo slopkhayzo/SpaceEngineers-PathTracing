@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 
 project(
     SpaceEngineersRTHWAccel
-    VERSION 0.3.0
+    VERSION 0.4.0
     DESCRIPTION "Hardware ray tracing for Space Engineers"
     LANGUAGES C CXX
 )
