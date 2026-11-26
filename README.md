@@ -10,7 +10,7 @@
 Path-traced lighting for *Space Engineers* (Steam, 64-bit), delivered as an
 ASI plugin like [SpaceEngineers.HighFPSFix](https://github.com/slopkhayzo/SpaceEngineers-HighFPS-RIL).
 
-**Status: 0.4.0.** The plugin replaces the game's lighting with light traced
+**Status: 0.5.0.** The plugin replaces the game's lighting with light traced
 by the GPU's ray-tracing hardware:
 - sunlight with soft shadows, and light from the sky;
 - the game's lamps, at any distance, with shadows;
@@ -24,11 +24,13 @@ like) and the blocks' armor skins.
 
 The traced light is denoised by NVIDIA DLSS Ray Reconstruction on GeForce
 RTX GPUs (which can also upscale light traced at a lower resolution: the
-DLSS modes), and by the plugin's own filter on other GPUs. NVIDIA DLSS Frame
-Generation is optional on GeForce RTX 40 and 50 series GPUs. The main
-settings are in the game's Options > Graphics > Path tracing. The game still
-draws fog, atmosphere, transparent surfaces, particles, post-processing and
-the HUD.
+upscaling modes), and on other GPUs by the plugin's own filter, then
+anti-aliased or upscaled by AMD FSR (FSR 3.1, or FSR 4 on the Radeons that
+support it). Frame generation is optional: NVIDIA DLSS Frame Generation on
+GeForce RTX 40 and 50 series GPUs, AMD FSR Frame Generation on any GPU. AMD
+GPUs are untested. The main settings are in the game's Options > Graphics >
+Path tracing. The game still draws fog, atmosphere, transparent surfaces,
+particles, post-processing and the HUD.
 
 It needs a GPU with DirectX Raytracing 1.1 and Space Engineers 1.211.017.
 Installation, settings and known gaps are in the release README
@@ -66,18 +68,25 @@ rests on and the progress log are in the private
   every lamp and glowing surface, rebuilt each frame) only where the pixels
   need them. Light samples are reused across frames and between
   neighbouring pixels.
-- **Denoising.** DLSS Ray Reconstruction (NVIDIA RTX), or the plugin's own
-  spatio-temporal filter.
-- **Frame generation.** DLSS Frame Generation only works on a D3D12 swap
-  chain, and the game presents through D3D11. So the plugin's presenter
-  takes over the game's `Present`. It copies each finished frame into a
-  D3D12 flip-model swap chain on a child window covering the game's client
-  area, made through NVIDIA Streamline's proxies (with manual hooking).
-  The traced frame hands Streamline its camera, motion and hardware depth
-  on the ray-tracing command list. The presenter adds the frame before the
-  HUD (copied right after the game draws its scene) and a UI layer (where
-  the finished frame differs from it). DLSS-G presents the real and the
-  generated frames from its own thread.
+- **Denoising and upscaling.** DLSS Ray Reconstruction (NVIDIA RTX), or the
+  plugin's own spatio-temporal filter followed by AMD FSR Upscaling, whose
+  output is composed over the game's surfaces. AMD's signed DLLs are loaded
+  from the plugin's folder after a signature check, and AMD's loader picks
+  the FSR version the GPU supports.
+- **Frame generation.** DLSS Frame Generation and FSR Frame Generation only
+  work on a D3D12 swap chain, and the game presents through D3D11. So the
+  plugin's presenter takes over the game's `Present`. It copies each
+  finished frame into a D3D12 flip-model swap chain on a child window
+  covering the game's client area. That chain is made through NVIDIA
+  Streamline's proxies (with manual hooking) for DLSS-G, or is AMD FSR's
+  frame generation swap chain. The traced frame hands its camera, motion
+  and hardware depth to Streamline, or to FSR's prepare pass, on the
+  ray-tracing command list, with either denoiser. The presenter adds the
+  frame before the HUD (copied right after the game draws its scene): DLSS-G
+  gets a UI layer made from it (where the finished frame differs from it),
+  FSR finds the HUD in it itself. Both present the real and the generated
+  frames from their own thread. Frame generation starts 10 s after a world loads,
+  and turns itself off if the presenter's queue keeps stalling.
 - **Composite.** At start the plugin applies a runtime patch to the game's
   `Lighting/LightDir.hlsl`. The patch works on a copy of the game's shader
   tree in `%LOCALAPPDATA%\SpaceEngineers.RTHWAccel`, which the plugin
@@ -99,12 +108,17 @@ downloads the pinned NVIDIA DLSS SDK files into `third_party/dlss`
 are present. DLSS Frame Generation is optional the same way:
 [scripts/fetch_streamline.ps1](scripts/fetch_streamline.ps1) downloads the
 pinned NVIDIA Streamline SDK into `third_party/streamline`, checked against
-its SHA-256 and NVIDIA's signature.
+its SHA-256 and NVIDIA's signature. AMD FSR (upscaling and frame generation)
+is optional too: [scripts/fetch_fsr.ps1](scripts/fetch_fsr.ps1) downloads
+the pinned AMD FSR SDK files (the FFX API headers and AMD's signed DLLs) into
+`third_party/fsr`, each checked against its git blob hash and the DLLs
+against AMD's signature.
 
 ```bat
 "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
 powershell -ExecutionPolicy Bypass -File scripts\fetch_dlss.ps1
 powershell -ExecutionPolicy Bypass -File scripts\fetch_streamline.ps1
+powershell -ExecutionPolicy Bypass -File scripts\fetch_fsr.ps1
 cmake -S . -B build-x64 -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo ^
   -DSERT_GAME_BIN64="D:/Program Files/Games/Steam/steamapps/common/SpaceEngineers/Bin64"
 cmake --build build-x64
@@ -154,7 +168,11 @@ The development INI ([config/](config/)) lists the debug views and the
 up, Ctrl down, Shift and Alt for speed, Q/E roll, the mouse wheel zooms), a
 screenshot key (F12 saves the frame without the HUD as a PNG in the game
 folder's `Screenshots`) and a tracing toggle (F2: the game's own lighting and
-back, for before/after shots).
+back, for before/after shots). For GPUs nobody here can test (AMD's),
+`[Debug] D3D12Validation` runs the plugin's device under the D3D12 debug
+layer (with GPU-based validation of resource states and DRED), its messages
+in the log, and `[Debug] GeometryTransport = texture` forces the fallback the
+plugin takes when a driver does not share the game's geometry buffers.
 
 ## Logs
 
@@ -184,10 +202,14 @@ excluded from Git. `research/tools` links to the shared tools folder.
   stored in Git) for DLSS Frame Generation and Reflex. Streamline is under
   the MIT License, DLSS-G under the NVIDIA RTX SDKs License, and Reflex
   under the NVIDIA SDK license.
+- [AMD FSR SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
+  2.4.0 (not stored in Git) for FSR Upscaling and FSR Frame Generation:
+  AMD's signed DLLs under AMD's license (binary redistribution only,
+  unmodified), the headers under MIT ([third_party/fsr/UPSTREAM.md](third_party/fsr/UPSTREAM.md)).
 
 ## License
 
-MIT, see [LICENSE](LICENSE). MinHook, the Ultimate ASI Loader and NVIDIA's
-DLSS and Streamline runtimes keep their own licenses
+MIT, see [LICENSE](LICENSE). MinHook, the Ultimate ASI Loader, NVIDIA's
+DLSS and Streamline runtimes and AMD's FSR runtime keep their own licenses
 ([third_party/](third_party/)), which are included in the release
 archives.
