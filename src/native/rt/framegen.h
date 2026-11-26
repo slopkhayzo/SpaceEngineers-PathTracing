@@ -15,11 +15,12 @@ namespace sert::rt {
 // presenter.cpp PresenterTagTraced): its depth and motion at the render size, its camera (camera-relative,
 // row-major matrices for row vectors, VRageMath's).
 struct FrameGenFrame {
-    ID3D12Resource* depth = nullptr;   // R32F linear view depth (far for the sky), unordered-access state after
-                                       // the frame
-    ID3D12Resource* hardwareDepth = nullptr;  // R32F at the render size, unordered-access state: the core's, the
-                                              // presenter's pass writes DLSS-G's hardware depth of `depth` into it
+    ID3D12Resource* hardwareDepth = nullptr;  // R32F at the render size, unordered-access state after the frame: the
+                                              // game's reverse-Z depth of each pixel (primary_view.hlsl UpscaleDepth)
     ID3D12Resource* motion = nullptr;  // RG16F in pixels (previous = current + motion), unordered-access state
+    float jitter[2]{};                 // the projection's jitter of the traced frame (pixels, y down)
+    double cameraPosition[3]{};        // world
+    float frameTimeMs = 16.7f;         // since the previous traced frame
     UINT width = 0;                    // the render size
     UINT height = 0;
     float projection[16]{};

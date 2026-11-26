@@ -222,10 +222,11 @@ namespace SpaceEngineers.RTHWAccel
         private static Type s_render;            // MyRender11, once the core started
         private static bool s_presenterStarted;  // its Present hooked and our window asked for
 
-        // The Path tracing screen's switch, while playing: DLSS Frame Generation on (the presenter started on first
-        // use, through Streamline) or off (the game's swap chain presents again; ours, and DLSS-G's resources, are
-        // let go). Returns NativeApi.RtFrameGenStatus's answer (2: it cannot run; `note` says why) or 0.
-        internal static int SetFrameGeneration(bool on, out string note)
+        // The Path tracing screen's choice, while playing: frame generation as `mode` asks (the presenter started on
+        // first use: through Streamline for DLSS-G, as AMD FSR's swap chain for FSR's; auto picks by the GPU) or off
+        // (the game's swap chain presents again; ours is let go). Returns NativeApi.RtFrameGenStatus's answer (2: it
+        // cannot run; `note` says why) or 0.
+        internal static int SetFrameGeneration(FrameGenerationMode mode, out string note)
         {
             note = "";
             if (s_render == null)
@@ -233,8 +234,9 @@ namespace SpaceEngineers.RTHWAccel
                 note = "the ray-tracing core is not running";
                 return 2;
             }
+            bool on = mode != FrameGenerationMode.Off;
             if (on || s_presenterStarted)
-                StartPresenter(s_render, on ? 3 : 0);
+                StartPresenter(s_render, Settings.PresenterModeFor(Settings.FrameGenerationName(mode)));
             return on ? NativeApi.RtFrameGenStatus(out note) : 0;
         }
 
@@ -252,7 +254,7 @@ namespace SpaceEngineers.RTHWAccel
             int status = NativeApi.RtInitialize(device.NativePointer, settings.GateMode, settings.DebugView,
                 settings.PatternStrength, settings.TracePath, settings.Denoiser, settings.CharacterLights,
                 settings.LampIntensity, settings.EmissiveIntensity, settings.DecalLights, settings.LightTree,
-                settings.DlssMode);
+                settings.DlssMode, settings.Upscaler, settings.FsrSharpness);
             if (status != 0)
             {
                 Log.Error($"The ray-tracing core did not start (step {status}, see above); the game renders as usual.");
@@ -275,7 +277,7 @@ namespace SpaceEngineers.RTHWAccel
                 NativeApi.RtSetOption(RtOption.SampleThreads, 1);
             s_render = render;
             if (settings.Presenter == "d3d12" || settings.FrameGeneration != "off")
-                StartPresenter(render, settings.FrameGeneration == "on" ? 3 : settings.FrameGeneration == "streamline" ? 2 : 1);
+                StartPresenter(render, settings.FrameGeneration == "off" ? 1 : Settings.PresenterModeFor(settings.FrameGeneration));
             try
             {
                 GameFrame.Resolve(render11);

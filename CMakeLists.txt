@@ -34,13 +34,15 @@ endif()
 
 set(sert_generated "${CMAKE_BINARY_DIR}/generated")
 set(sert_shader_headers "")
-# <name>_cs.h defines `variable` as the DXIL of `source` (entry point main).
+# <name>_cs.h defines `variable` as the DXIL of `source` (entry point main). Denormal floats are preserved (shader
+# model 6.2 and up): integers kept in float bit patterns are denormals for small values, which the default mode lets a
+# GPU flush to zero in any float operation the compiler puts on them (met once on NVIDIA, main plan P2q).
 function(sert_compute_shader name source profile variable)
     set(header "${sert_generated}/${name}_cs.h")
     add_custom_command(
         OUTPUT "${header}"
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${sert_generated}"
-        COMMAND "${SERT_DXC}" -nologo -T ${profile} -E main -O3 -Qstrip_debug -Qstrip_reflect
+        COMMAND "${SERT_DXC}" -nologo -T ${profile} -E main -O3 -denorm preserve -Qstrip_debug -Qstrip_reflect
                 -Fh "${header}" -Vn ${variable} "${CMAKE_SOURCE_DIR}/${source}"
         DEPENDS "${CMAKE_SOURCE_DIR}/${source}" ${sert_shader_includes}
         COMMENT "Compiling ${source} (${profile})"
@@ -67,16 +69,17 @@ endfunction()
 # The shaders' shared includes (a change rebuilds every shader).
 file(GLOB sert_shader_includes CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/shaders/*.hlsli")
 
-sert_compute_shader(debug_view src/shaders/debug_view.hlsl cs_6_0 g_debugViewCs)
-sert_compute_shader(denoise src/shaders/denoise.hlsl cs_6_0 g_denoiseCs)
+sert_compute_shader(debug_view src/shaders/debug_view.hlsl cs_6_2 g_debugViewCs)
+sert_compute_shader(denoise src/shaders/denoise.hlsl cs_6_2 g_denoiseCs)
 sert_compute_shader(emissive_lights src/shaders/emissive_lights.hlsl cs_6_5 g_emissiveLightsCs)
-sert_compute_shader(decode_positions src/shaders/decode_positions.hlsl cs_6_0 g_decodePositionsCs)
-sert_compute_shader(expand_blocks src/shaders/expand_blocks.hlsl cs_6_0 g_expandBlocksCs)
-sert_compute_shader(skin_vertices src/shaders/skin_vertices.hlsl cs_6_0 g_skinVerticesCs)
+sert_compute_shader(decode_positions src/shaders/decode_positions.hlsl cs_6_2 g_decodePositionsCs)
+sert_compute_shader(expand_blocks src/shaders/expand_blocks.hlsl cs_6_2 g_expandBlocksCs)
+sert_compute_shader(skin_vertices src/shaders/skin_vertices.hlsl cs_6_2 g_skinVerticesCs)
 sert_compute_shader(primary_view src/shaders/primary_view.hlsl cs_6_5 g_primaryViewCs)
-sert_compute_shader(fg_ui src/shaders/fg_ui.hlsl cs_6_0 g_fgUiCs)
+sert_compute_shader(fg_ui src/shaders/fg_ui.hlsl cs_6_2 g_fgUiCs)
 sert_d3d11_compute_shader(pack_gbuffer src/shaders/pack_gbuffer.hlsl g_packGbufferCs)
 sert_d3d11_compute_shader(env_atlas src/shaders/env_atlas.hlsl g_envAtlasCs)
+sert_d3d11_compute_shader(transport_texture src/shaders/transport_texture.hlsl g_transportTextureCs)
 add_custom_target(SpaceEngineersRTHWAccelShaders DEPENDS ${sert_shader_headers})
 
 # ---------------------------------------------------------------------------
@@ -99,11 +102,13 @@ add_library(SpaceEngineersRTHWAccel MODULE
     src/native/rt/common.cpp
     src/native/rt/dlss.cpp
     src/native/rt/framegen.cpp
+    src/native/rt/fsr.cpp
     src/native/rt/presenter.cpp
     src/native/rt/sampler.cpp
     src/native/rt/rt_core.cpp
     src/native/rt/scene.cpp
     src/native/rt/textures.cpp
+    src/native/rt/validation.cpp
     src/native/rt/vtable_index.c
 )
 add_dependencies(SpaceEngineersRTHWAccel SpaceEngineersRTHWAccelShaders)
@@ -190,6 +195,46 @@ if(SERT_STREAMLINE_FOUND)
     endforeach()
 else()
     message(STATUS "Streamline SDK not found (scripts/fetch_streamline.ps1): building without frame generation")
+endif()
+
+# AMD FSR (optional): AMD's FSR SDK in third_party/fsr, fetched by scripts/fetch_fsr.ps1
+# (third_party/fsr/UPSTREAM.md). The plugin loads AMD's signed DLLs from its own folder at
+# run time (nothing is linked); without them it builds with FSR unavailable.
+set(SERT_FSR_DIR "${CMAKE_SOURCE_DIR}/third_party/fsr/Kits/FidelityFX")
+set(SERT_FSR_RUNTIMES
+    amd_fidelityfx_loader_dx12.dll amd_fidelityfx_upscaler_dx12.dll amd_fidelityfx_framegeneration_dx12.dll)
+set(SERT_FSR_FOUND TRUE)
+foreach(header IN ITEMS api/include/ffx_api.h upscalers/include/ffx_upscale.h
+                        framegeneration/include/ffx_framegeneration.h)
+    if(NOT EXISTS "${SERT_FSR_DIR}/${header}")
+        set(SERT_FSR_FOUND FALSE)
+    endif()
+endforeach()
+foreach(runtime IN LISTS SERT_FSR_RUNTIMES)
+    if(NOT EXISTS "${SERT_FSR_DIR}/signedbin/${runtime}")
+        set(SERT_FSR_FOUND FALSE)
+    endif()
+endforeach()
+set(sert_fsr_package_args "")
+if(SERT_FSR_FOUND)
+    message(STATUS "AMD FSR SDK found: building with FSR")
+    set(sert_fsr_package_args "-DFSR_DIR=${SERT_FSR_DIR}")
+    target_include_directories(SpaceEngineersRTHWAccel SYSTEM PRIVATE
+        "${SERT_FSR_DIR}/api/include"
+        "${SERT_FSR_DIR}/upscalers/include"
+        "${SERT_FSR_DIR}/framegeneration/include"
+    )
+    target_compile_definitions(SpaceEngineersRTHWAccel PRIVATE SERT_FSR=1)
+    target_link_libraries(SpaceEngineersRTHWAccel PRIVATE wintrust crypt32)
+    foreach(runtime IN LISTS SERT_FSR_RUNTIMES)
+        add_custom_command(TARGET SpaceEngineersRTHWAccel POST_BUILD
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${SERT_FSR_DIR}/signedbin/${runtime}"
+                    "$<TARGET_FILE_DIR:SpaceEngineersRTHWAccel>/${runtime}"
+            VERBATIM
+        )
+    endforeach()
+else()
+    message(STATUS "AMD FSR SDK not found (scripts/fetch_fsr.ps1): building without FSR")
 endif()
 set_target_properties(SpaceEngineersRTHWAccel PROPERTIES
     OUTPUT_NAME "${SERT_NAME}"
@@ -417,6 +462,7 @@ add_custom_target(package_plugin_only
             -DARCHIVE_FILE=${CMAKE_SOURCE_DIR}/dist/${SERT_NAME}-${PROJECT_VERSION}-plugin-only.zip
             ${sert_dlss_package_args}
             ${sert_streamline_package_args}
+            ${sert_fsr_package_args}
             -P "${SERT_PACKAGE_SCRIPT}"
     DEPENDS SpaceEngineersRTHWAccel SpaceEngineersRTHWAccelManaged
     VERBATIM
@@ -440,6 +486,7 @@ if(SERT_ULTIMATE_ASI_LOADER_DLL AND EXISTS "${SERT_ULTIMATE_ASI_LOADER_DLL}")
                 -DARCHIVE_FILE=${CMAKE_SOURCE_DIR}/dist/${SERT_NAME}-${PROJECT_VERSION}-with-Ultimate-ASI-Loader.zip
                 ${sert_dlss_package_args}
                 ${sert_streamline_package_args}
+                ${sert_fsr_package_args}
                 -P "${SERT_PACKAGE_SCRIPT}"
         DEPENDS SpaceEngineersRTHWAccel SpaceEngineersRTHWAccelManaged
         VERBATIM

@@ -130,6 +130,9 @@ RWTexture2D<float4> RrSpecularAlbedo : register(u21);
 RWTexture2D<float4> RrNormalRoughness : register(u22);   // world normal, roughness
 RWTexture2D<float> RrDepth : register(u23);              // linear view depth (far for the sky)
 RWTexture2D<float> RrSpecularHitDistance : register(u25);  // the specular bounce's length (far: it escaped)
+// The game's reverse-Z depth of what each pixel shows, for FSR and frame generation (Ray Reconstruction's view and
+// UpscaleInputs; 0 for the sky).
+RWTexture2D<float> UpscaleDepth : register(u29);
 // Per geometry record (its index x 4): OpenGeneration once the camera saw one of its surfaces through a face of
 // their own object (rt_core.cpp seenThrough): the pixels that show its surfaces look whether they are seen so.
 RWByteAddressBuffer SeenThrough : register(u26);
@@ -1700,7 +1703,12 @@ bool ReprojectHistory(float3 previousPoint, out float4 diffuse, out float4 specu
     if (clip.w <= 0)
         return false;
     float2 previousUv = float2(clip.x / clip.w * 0.5 + 0.5, 0.5 - clip.y / clip.w * 0.5);
-    float2 pixel = previousUv * float2(Width, Height) - 0.5;
+    // The history holds each pixel's light (accumulated from its jittered samples): it is read where the pixel's
+    // centre was, the jittered sample's previous position less this frame's jitter. Read at the sample's own
+    // position, a still history was resampled at another sub-pixel offset every frame, and over a long history
+    // (256 frames with the camera still) the light spread by several pixels: smears and ghosts around edges, the
+    // larger the fewer pixels the light is traced at (FSR's modes).
+    float2 pixel = previousUv * float2(Width, Height) - 0.5 - Jitter;
     int2 corner = (int2)floor(pixel);
     float2 f = pixel - corner;
     float weightSum = 0;
@@ -1877,6 +1885,7 @@ void main(uint3 id : SV_DispatchThreadID)
     float shade = 0.25 + 0.75 * abs(dot(s.geometricNormal, view));
     float3 color = float3(0.02, 0.02, 0.05);
     float alpha = Strength;
+    float upscaleZ = 0;  // the view depth UpscaleDepth takes (0: the sky)
     if (Mode == 0)
     {
         if (hit)
@@ -2203,6 +2212,7 @@ void main(uint3 id : SV_DispatchThreadID)
                 // This frame's sample joins the history of the point it sees; glossy reflections, which move
                 // with the camera unlike the surface, keep a shorter one. Mode 11 hands this frame's light,
                 // before the accumulation, to Ray Reconstruction (which accumulates itself).
+                upscaleZ = FullCoverage != 0 ? rayZ : rasterZ;
                 if (Mode == 11)
                 {
                     float emissionLight = material.emissive * Game.Post.BloomEmissiveness;
@@ -2271,6 +2281,7 @@ void main(uint3 id : SV_DispatchThreadID)
                 float3 environment = hit ? float3(0, 0, 0) : EnvironmentRadiance(direction);
                 if (background)
                     color = environment;
+                upscaleZ = hit ? (rasterZ > 0 ? rasterZ : rayZ) : 0;
                 if (Mode == 11)
                 {
                     // The sky as the DLSS-RR Integration Guide wants it (3.4): mid-grey diffuse albedo, no
@@ -2365,8 +2376,15 @@ void main(uint3 id : SV_DispatchThreadID)
             color = 0.15 * shade;
         }
     }
-    // Traced smaller than the game's size (DLSS modes), the output is denoise.hlsl pass 3's: Ray
-    // Reconstruction's light, upscaled.
+    // Traced smaller than the game's size (DLSS and FSR modes), the output is denoise.hlsl pass 3's: Ray
+    // Reconstruction's or FSR's light, upscaled.
     if (!Upscaled())
         Output[id.xy] = float4(color, alpha);
+    // FSR's inputs after our filter (UpscaleInputs bit 1): every pixel's light (pass 2 puts the filtered light over
+    // the lit pixels'); for FSR and frame generation (bit 2) and Ray Reconstruction's view, the game's reverse-Z depth
+    // of what the pixel shows (rt_core.cpp RecordFrame).
+    if ((UpscaleInputs & 1) != 0)
+        RrColor[id.xy] = float4(color, alpha);
+    if (UpscaleInputs != 0 || Mode == 11)
+        UpscaleDepth[id.xy] = upscaleZ > 0 ? saturate(ProjM43 / upscaleZ - ProjM33) : 0;
 }

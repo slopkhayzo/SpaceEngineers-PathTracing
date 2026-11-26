@@ -18,8 +18,8 @@ namespace SpaceEngineers.RTHWAccel
     // does not count those fields as blittable and may reorder them.
     internal static unsafe class NativeApi
     {
-        public const uint ExpectedVersion = 19;
-        public const uint ExpectedSize = 288;
+        public const uint ExpectedVersion = 20;
+        public const uint ExpectedSize = 296;
 
         // sert::RtOptions.
         [StructLayout(LayoutKind.Sequential)]
@@ -36,7 +36,9 @@ namespace SpaceEngineers.RTHWAccel
             public float EmissiveIntensity;  // the light emissive surfaces cast (not their own glow)
             public int DecalLights;          // 1: glowing decals are lights
             public int LightTree;            // 1: lamps and emitters traced at any distance (the light tree)
-            public int DlssMode;             // DlssMode: Ray Reconstruction's upscaling
+            public int DlssMode;             // DlssMode: the upscaling mode (Ray Reconstruction's, FSR's)
+            public int Upscaler;             // Upscaler: what upscales our filter's light
+            public float FsrSharpness;       // FSR's sharpening, 0 (off) to 1
         }
 
         private static delegate* unmanaged[Cdecl]<IntPtr, IntPtr, IntPtr*, int> s_createHook;
@@ -74,6 +76,7 @@ namespace SpaceEngineers.RTHWAccel
         private static delegate* unmanaged[Cdecl]<int> s_rtPresenterAttach;
         private static delegate* unmanaged[Cdecl]<void> s_rtCaptureHudless;
         private static delegate* unmanaged[Cdecl]<char*, int, int> s_rtFrameGenStatus;
+        private static delegate* unmanaged[Cdecl]<char*, int, int> s_rtFsrStatus;
 
         public static bool IsBound => s_log != null;
 
@@ -137,6 +140,7 @@ namespace SpaceEngineers.RTHWAccel
             s_rtPresenterAttach = (delegate* unmanaged[Cdecl]<int>)*(IntPtr*)(bytes + 264);
             s_rtCaptureHudless = (delegate* unmanaged[Cdecl]<void>)*(IntPtr*)(bytes + 272);
             s_rtFrameGenStatus = (delegate* unmanaged[Cdecl]<char*, int, int>)*(IntPtr*)(bytes + 280);
+            s_rtFsrStatus = (delegate* unmanaged[Cdecl]<char*, int, int>)*(IntPtr*)(bytes + 288);
             return null;
         }
 
@@ -166,7 +170,7 @@ namespace SpaceEngineers.RTHWAccel
         // Returns 0, or the number of the RT core's step that failed (logged natively).
         public static int RtInitialize(IntPtr d3d11Device, GateMode gateMode, DebugView debugView, float patternStrength,
             string tracePath, Denoiser denoiser, bool characterLights, float lampIntensity, float emissiveIntensity,
-            bool decalLights, bool lightTree, DlssMode dlssMode)
+            bool decalLights, bool lightTree, DlssMode dlssMode, Upscaler upscaler, float fsrSharpness)
         {
             fixed (char* path = tracePath ?? "")
             {
@@ -184,6 +188,8 @@ namespace SpaceEngineers.RTHWAccel
                     DecalLights = decalLights ? 1 : 0,
                     LightTree = lightTree ? 1 : 0,
                     DlssMode = (int)dlssMode,
+                    Upscaler = (int)upscaler,
+                    FsrSharpness = fsrSharpness,
                 };
                 CurrentGateMode = gateMode;
                 return s_rtInitialize(d3d11Device, &options);
@@ -394,6 +400,17 @@ namespace SpaceEngineers.RTHWAccel
             return status;
         }
 
+        // Whether AMD FSR can upscale: 0 yes, 1 not known yet (it loads with the first frame that would use it), 2 no;
+        // `text` the versions it offers, or why not.
+        public static int RtFsrStatus(out string text)
+        {
+            const int capacity = 512;
+            char* buffer = stackalloc char[capacity];
+            int status = s_rtFsrStatus(buffer, capacity);
+            text = new string(buffer);
+            return status;
+        }
+
         // The projected decals of the next frame, in the game's draw order (copied by the native side).
         public static void RtDecalsSubmit(RtDecal[] decals, int count)
         {
@@ -591,13 +608,34 @@ namespace SpaceEngineers.RTHWAccel
         PresentSync = 6,        // frame generation: our presents' sync interval (-1: the game's, 0, 1)
         ReflexMode = 7,         // frame generation: Reflex's mode (0 off, 1 low latency: the default, 2 boost)
         SampleThreads = 8,      // diagnostics: the thread sampler on (1) or off (0)
+        Upscaler = 9,           // value: (int)Upscaler
+        FsrSharpness = 10,      // 0 (off) to 1
+        FsrDebugView = 11,      // diagnostics: FSR's debug view in the output (1) or not (0)
     }
 
-    // sert::rt::DlssMode: the size Ray Reconstruction's light is traced at (it upscales to the game's). Only where Ray
-    // Reconstruction denoises the lit view in replace mode.
+    // Frame generation as the player chooses it (Settings.FrameGenerationMode; NativeApi.RtSetPresenter's modes 0, 6,
+    // 3 and 4).
+    internal enum FrameGenerationMode
+    {
+        Off = 0,
+        Auto = 1,  // DLSS Frame Generation on NVIDIA GPUs that run it, else AMD FSR's
+        Dlss = 2,  // DLSS Frame Generation (GeForce RTX 40 and 50 series)
+        Fsr = 3,   // AMD FSR Frame Generation (any GPU the plugin runs on)
+    }
+
+    // sert::rt::Upscaler: what upscales the light our filter denoised (Ray Reconstruction upscales by itself).
+    internal enum Upscaler
+    {
+        Auto = 0,  // AMD FSR where available
+        Fsr = 1,   // AMD FSR (our filter alone when it is unavailable)
+        Off = 2,   // none: our filter at the game's size
+    }
+
+    // sert::rt::DlssMode: the upscaling mode, the size the lit view's light is traced at (Ray Reconstruction, or FSR
+    // after our filter, upscales it to the game's). Only for the lit view in replace mode.
     internal enum DlssMode
     {
-        Dlaa = 0,              // the game's size
+        Dlaa = 0,              // the game's size (DLAA; FSR's native AA)
         Quality = 1,           // about 67 % per axis
         Balanced = 2,          // about 58 %
         Performance = 3,       // 50 %
@@ -628,6 +666,7 @@ namespace SpaceEngineers.RTHWAccel
         LitFilter = 17,       // traced light denoised by our filter
         EmittersReference = 18,  // the emitters view without reusing light samples: what it must match on average
         EmittersPowerGrid = 19,  // the emitters view with P2p's light grid (lights drawn by power alone): the A/B
+        LitFsr = 20,          // traced light denoised by our filter, then AMD FSR Upscaling (replace mode)
     }
 
     // sert::rt::GateMode.

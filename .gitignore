@@ -15,3 +15,7 @@ __pycache__/
 # NVIDIA Streamline SDK files, fetched by scripts/fetch_streamline.ps1 (UPSTREAM.md records the version).
 /third_party/streamline/*
 !/third_party/streamline/UPSTREAM.md
+
+# AMD FSR SDK files, fetched by scripts/fetch_fsr.ps1 (UPSTREAM.md records the version).
+/third_party/fsr/*
+!/third_party/fsr/UPSTREAM.md

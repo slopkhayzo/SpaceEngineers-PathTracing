@@ -47,6 +47,8 @@ enum class DebugView : int {
                              // unbiased): what the emitters view must match on average
     emittersPowerGrid = 19,  // the emitters view with P2p's light grid (its lights drawn by power alone, no
                              // jittered cells): the cells' lists' A/B
+    litFsr = 20,             // traced light denoised by our filter, then AMD FSR Upscaling (in replace mode; when
+                             // available)
 };
 
 // What denoises the lit view's traced light.
@@ -56,15 +58,23 @@ enum class Denoiser : int {
     filter = 2,             // our filter (denoise.hlsl)
 };
 
-// The DLSS mode of Ray Reconstruction: the size the lit view's light is traced at, which Ray Reconstruction
-// upscales to the game's (NVIDIA's render sizes for each mode: dlss::RenderSize). Only where Ray Reconstruction
-// denoises a lit view in replace mode; our filter and the overlay composite trace at the game's size.
+// The upscaling mode (the UpscalingMode setting; DlssMode before FSR): the size the lit view's light is traced at,
+// which Ray Reconstruction, or FSR after our filter, upscales to the game's (NVIDIA's render sizes for each mode:
+// dlss::RenderSize; AMD's: fsr::RenderSize). Only for the lit view in replace mode; our filter alone and the overlay
+// composite trace at the game's size.
 enum class DlssMode : int {
-    dlaa = 0,              // the game's size (DLAA)
+    dlaa = 0,              // the game's size (DLAA; FSR's native AA)
     quality = 1,           // about 67 % per axis
     balanced = 2,          // about 58 %
     performance = 3,       // 50 %
     ultraPerformance = 4,  // about 33 %
+};
+
+// What upscales the light our filter denoised (Ray Reconstruction upscales by itself).
+enum class Upscaler : int {
+    automatic = 0,  // AMD FSR where available
+    fsr = 1,        // AMD FSR (our filter alone when it is unavailable)
+    off = 2,        // none: our filter at the game's size
 };
 
 struct Options {
@@ -78,7 +88,9 @@ struct Options {
     float emissiveIntensity = 1.0f;  // the light emissive surfaces cast (lights.hlsli Emission), not their own glow
     bool decalLights = true;  // glowing decals are lights (else they only glow; SetDecalLights changes it)
     bool lightTree = false;   // lamps and emitters traced at any distance (the grid's coarse levels, the tree)
-    DlssMode dlssMode = DlssMode::dlaa;  // Ray Reconstruction's upscaling (SetDlssMode changes it)
+    DlssMode dlssMode = DlssMode::dlaa;  // the upscaling mode (SetDlssMode changes it)
+    Upscaler upscaler = Upscaler::automatic;  // what upscales our filter's light (Option::upscaler)
+    float fsrSharpness = 0.0f;  // FSR's sharpening, 0 (off) to 1 (Option::fsrSharpness)
 };
 
 // Creates the D3D12 device on the adapter of the game's D3D11 device, the
@@ -133,13 +145,27 @@ enum class Option : int {
     presentSync = 6,        // frame generation: our presents' sync interval (-1: the game's, 0, 1)
     reflexMode = 7,         // frame generation: Reflex's mode (0 off, 1 low latency: the default, 2 with boost)
     sampleThreads = 8,      // diagnostics: the thread sampler (sampler.h) on (1) or off (0)
-    last = sampleThreads,
+    upscaler = 9,           // value: Upscaler
+    fsrSharpness = 10,      // 0 (off) to 1: FSR's sharpening
+    fsrDebugView = 11,      // diagnostics: FSR's debug view in the output (1) or not (0)
+    last = fsrDebugView,
 };
 // Any thread. One of the settings above, from the next frame on; starts a fresh statistics window.
 void SetOption(Option option, float value);
 
-// After Initialize: the presenter (presenter.h; `mode` a PresenterMode) on the game's swap chain `swapChain`
-// (an IDXGISwapChain); `window` (if not null) gets the game's window. False when it could not be set up.
+// Whether AMD FSR can upscale: 0 yes, 1 not known yet (it loads with the first frame that would use it), 2 no.
+// `text` gets the versions it offers, or why not.
+int FsrStatus(std::wstring& text);
+
+// Whether the frame generation the presenter was last set to (DLSS-G through Streamline, or AMD FSR's) can run: 0
+// yes, 1 not known yet, 2 no. `text` gets why not, or when it can, anything that hurts it.
+int FrameGenerationStatus(std::wstring& text);
+
+// After Initialize: the presenter (presenter.h) on the game's swap chain `swapChain` (an IDXGISwapChain) in `mode`:
+// 0 the game's chain presents, 1 ours, 2 ours through Streamline (DLSS-G off), 3 DLSS-G on, 4 ours as AMD FSR's
+// frame generation swap chain with its generation on, 5 that with it off, 6 frame generation as the GPU allows
+// (DLSS-G on NVIDIA GPUs that run it, else FSR's). `window` (if not null) gets the game's window. False when it could
+// not be set up.
 bool SetPresenter(void* swapChain, int mode, void** window);
 // On the thread of the game's window, after SetPresenter: the presenter's window made (PresenterAttachWindow).
 bool AttachPresenterWindow();

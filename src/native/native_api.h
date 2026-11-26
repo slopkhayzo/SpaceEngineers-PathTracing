@@ -38,13 +38,21 @@ struct RtOptions {
     // Lamps and emitters traced at any distance (1: the light grid's coarse
     // levels, filled from the light tree) or 32 m around the camera (0).
     std::int32_t lightTree;
-    // DLSS mode of Ray Reconstruction (rt::DlssMode): 0 DLAA (the light traced
-    // at the game's resolution), 1 quality, 2 balanced, 3 performance, 4 ultra
-    // performance (traced at a smaller size, Ray Reconstruction upscaling).
+    // The upscaling mode (rt::DlssMode): 0 DLAA or FSR's native AA (the light
+    // traced at the game's resolution), 1 quality, 2 balanced, 3 performance,
+    // 4 ultra performance (traced at a smaller size, Ray Reconstruction or FSR
+    // upscaling).
     std::int32_t dlssMode;
+    // What upscales our filter's light (rt::Upscaler): 0 AMD FSR where
+    // available, 1 AMD FSR, 2 none.
+    std::int32_t upscaler;
+    // FSR's sharpening, 0 (off) to 1.
+    float fsrSharpness;
 };
 
-static_assert(sizeof(RtOptions) == 56);
+static_assert(sizeof(RtOptions) == 64);
+static_assert(offsetof(RtOptions, upscaler) == 52);
+static_assert(offsetof(RtOptions, fsrSharpness) == 56);
 static_assert(offsetof(RtOptions, tracePath) == 16);
 static_assert(offsetof(RtOptions, denoiser) == 24);
 static_assert(offsetof(RtOptions, characterLights) == 28);
@@ -125,9 +133,11 @@ struct NativeApi {
     void(__cdecl* rtSetOption)(int option, float value);
     // The presenter: 0 the game's swap chain presents, 1 ours (a D3D12
     // flip-model chain over the game's window), 2 ours through Streamline
-    // (DLSS Frame Generation off), 3 that with DLSS-G on; the game's
-    // IDXGISwapChain (its first call hooks Present); `window` gets the game's
-    // window. 0 when set.
+    // (DLSS Frame Generation off), 3 that with DLSS-G on, 4 ours as AMD FSR's
+    // frame generation swap chain with its generation on, 5 that with it off,
+    // 6 frame generation as the GPU allows (DLSS-G on NVIDIA GPUs that run it,
+    // else FSR's); the game's IDXGISwapChain (its first call hooks Present);
+    // `window` gets the game's window. 0 when set.
     int(__cdecl* rtSetPresenter)(void* swapChain, int mode, void** window);
     // On the thread of the game's window: the presenter's window made over
     // it (until then the game's swap chain presents). 0 when made.
@@ -139,10 +149,14 @@ struct NativeApi {
     // loads with the presenter), 2 no. `text` (`capacity` characters, ended
     // by a 0) gets why not, or when it can, anything that hurts it.
     int(__cdecl* rtFrameGenStatus)(wchar_t* text, int capacity);
+    // Whether AMD FSR can upscale: 0 yes, 1 not known yet (it loads with the
+    // first frame that would use it), 2 no. `text` (`capacity` characters,
+    // ended by a 0) gets the versions it offers, or why not.
+    int(__cdecl* rtFsrStatus)(wchar_t* text, int capacity);
 };
 
 // The managed side reads the table by these offsets (NativeApi.cs).
-static_assert(sizeof(NativeApi) == 288);
+static_assert(sizeof(NativeApi) == 296);
 static_assert(offsetof(NativeApi, createHook) == 8);
 static_assert(offsetof(NativeApi, applyQueued) == 16);
 static_assert(offsetof(NativeApi, removeHook) == 24);
@@ -178,6 +192,7 @@ static_assert(offsetof(NativeApi, rtSetPresenter) == 256);
 static_assert(offsetof(NativeApi, rtPresenterAttach) == 264);
 static_assert(offsetof(NativeApi, rtCaptureHudless) == 272);
 static_assert(offsetof(NativeApi, rtFrameGenStatus) == 280);
+static_assert(offsetof(NativeApi, rtFsrStatus) == 288);
 
 [[nodiscard]] bool InitializeHooking();
 [[nodiscard]] const NativeApi* GetNativeApi();

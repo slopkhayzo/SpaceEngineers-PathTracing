@@ -29,15 +29,23 @@ param(
     # [RayTracing] GateMode: off, roundtrip, overlay, replace.
     [ValidateSet('', 'off', 'roundtrip', 'overlay', 'replace')][string]$GateMode = '',
     # Shortcuts for the play profile: [RayTracing] DebugView (lit, lit-raw, ...),
-    # Denoiser, DlssMode, CharacterLights, LampIntensity and EmissiveIntensity
-    # (numbers, 0 to 100; empty: the INI's).
+    # Denoiser, UpscalingMode (-DlssMode or -UpscalingMode; native and dlaa are
+    # the same), Upscaler (with the plugin's filter: auto, fsr, off),
+    # CharacterLights, LampIntensity and EmissiveIntensity (numbers, 0 to 100;
+    # empty: the INI's).
     [string]$DebugView = '',
     [ValidateSet('', 'auto', 'rr', 'filter')][string]$Denoiser = '',
-    [ValidateSet('', 'dlaa', 'quality', 'balanced', 'performance', 'ultra-performance')][string]$DlssMode = '',
+    [Alias('UpscalingMode')]
+    [ValidateSet('', 'dlaa', 'native', 'quality', 'balanced', 'performance', 'ultra-performance')][string]$DlssMode = '',
+    [ValidateSet('', 'auto', 'fsr', 'off')][string]$Upscaler = '',
     [ValidateSet('', 'on', 'off')][string]$CharacterLights = '',
     [ValidateSet('', 'on', 'off')][string]$DecalLights = '',
     [string]$LampIntensity = '',
     [string]$EmissiveIntensity = '',
+    # [RayTracing] FsrSharpness: AMD FSR's sharpening, 0 to 1 (empty: the INI's).
+    [string]$FsrSharpness = '',
+    # [RayTracing] FrameGeneration, the player's choice: off, auto, dlss, fsr (empty: the INI's).
+    [ValidateSet('', 'off', 'auto', 'dlss', 'fsr')][string]$FrameGeneration = '',
     # [Debug] InspectorSequence: every gate mode in turn, screenshots, timings.
     [switch]$Inspector,
     # [Debug] FreeCamera: the game's spectator camera (F8) in this world even if it does not allow it.
@@ -80,9 +88,11 @@ if (-not $Loader) { $Loader = Join-Path $root 'research\loader\version.dll' }
 $bin = Join-Path $root "$BuildDir\bin"
 if ($PackageDir) {
     $bin = (Resolve-Path $PackageDir).Path
-    # The bundled loader: any DLL but the plugin's and NVIDIA's runtimes (DLSS's nvngx_*, Streamline's sl.*).
+    # The bundled loader: any DLL but the plugin's, NVIDIA's runtimes (DLSS's nvngx_*, Streamline's sl.*) and AMD's
+    # (FSR's amd_fidelityfx_*).
     $bundled = Get-ChildItem $bin -Filter '*.dll' |
-        Where-Object { $_.Name -notlike "$pluginName*" -and $_.Name -notlike 'nvngx_*' -and $_.Name -notlike 'sl.*' } |
+        Where-Object { $_.Name -notlike "$pluginName*" -and $_.Name -notlike 'nvngx_*' -and $_.Name -notlike 'sl.*' -and
+                       $_.Name -notlike 'amd_fidelityfx_*' } |
         Select-Object -First 1
     if ($bundled) { $Loader = $bundled.FullName; $LoaderNames = @($bundled.Name) }
 }
@@ -177,7 +187,9 @@ if ($Skins) { $ini = Set-IniValue $ini 'Debug' 'LookAtSkins' $Skins }
 if ($GateMode) { $ini = Set-IniValue $ini 'RayTracing' 'GateMode' $GateMode }
 if ($DebugView) { $ini = Set-IniValue $ini 'RayTracing' 'DebugView' $DebugView }
 if ($Denoiser) { $ini = Set-IniValue $ini 'RayTracing' 'Denoiser' $Denoiser }
-if ($DlssMode) { $ini = Set-IniValue $ini 'RayTracing' 'DlssMode' $DlssMode }
+if ($DlssMode) { $ini = Set-IniValue $ini 'RayTracing' 'UpscalingMode' $DlssMode }
+if ($Upscaler) { $ini = Set-IniValue $ini 'RayTracing' 'Upscaler' $Upscaler }
+if ($FrameGeneration) { $ini = Set-IniValue $ini 'RayTracing' 'FrameGeneration' $FrameGeneration }
 if ($CharacterLights) {
     $ini = Set-IniValue $ini 'RayTracing' 'CharacterLights' $(if ($CharacterLights -eq 'on') { 'true' } else { 'false' })
 }
@@ -193,6 +205,14 @@ foreach ($key in 'LampIntensity', 'EmissiveIntensity') {
         throw "-$key must be a number from 0 to 100, not '$text'"
     }
     $ini = Set-IniValue $ini 'RayTracing' $key $number.ToString([Globalization.CultureInfo]::InvariantCulture)
+}
+if ($FsrSharpness) {
+    $number = 0.0
+    if (-not [double]::TryParse($FsrSharpness, [Globalization.NumberStyles]::Float,
+            [Globalization.CultureInfo]::InvariantCulture, [ref]$number) -or $number -lt 0 -or $number -gt 1) {
+        throw "-FsrSharpness must be a number from 0 to 1, not '$FsrSharpness'"
+    }
+    $ini = Set-IniValue $ini 'RayTracing' 'FsrSharpness' $number.ToString([Globalization.CultureInfo]::InvariantCulture)
 }
 foreach ($assignment in ($Set -split ';' | Where-Object { $_.Trim() })) {
     if ($assignment -notmatch '^\s*([^.=]+)\.([^=]+?)\s*=\s*(.*)$') { throw "Bad -Set entry '$assignment'" }
@@ -238,10 +258,11 @@ try {
             Add-Installed $target; Copy-Item -Force $source $target
         }
     }
-    # The NVIDIA runtimes the build ships next to the plugin (DLSS Ray Reconstruction with the DLSS SDK; Streamline
-    # and DLSS Frame Generation with the Streamline SDK); never over another copy.
+    # The NVIDIA and AMD runtimes the build ships next to the plugin (DLSS Ray Reconstruction with the DLSS SDK;
+    # Streamline and DLSS Frame Generation with the Streamline SDK; FSR with AMD's FSR SDK); never over another copy.
     foreach ($runtime in @('nvngx_dlssd.dll', 'sl.interposer.dll', 'sl.common.dll', 'sl.dlss_g.dll', 'sl.reflex.dll',
-                           'sl.pcl.dll', 'nvngx_dlssg.dll')) {
+                           'sl.pcl.dll', 'nvngx_dlssg.dll', 'amd_fidelityfx_loader_dx12.dll',
+                           'amd_fidelityfx_upscaler_dx12.dll', 'amd_fidelityfx_framegeneration_dx12.dll')) {
         $runtimeSource = Join-Path $bin $runtime
         if (-not (Test-Path $runtimeSource)) { continue }
         $runtimeTarget = Join-Path $GameBin64 $runtime

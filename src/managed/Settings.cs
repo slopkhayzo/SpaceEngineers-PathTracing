@@ -37,9 +37,15 @@ namespace SpaceEngineers.RTHWAccel
         // Lamps and emitters traced at any distance (the light grid's coarse levels beyond its fine one, filled
         // from the light tree), else 32 m around the camera, beyond which the game's own lamp light takes over.
         public bool LightTree = true;
-        // The DLSS mode of Ray Reconstruction: dlaa (the light traced at the game's resolution), quality, balanced,
-        // performance, ultra-performance (traced smaller, upscaled by Ray Reconstruction).
+        // The upscaling mode ([RayTracing] UpscalingMode; DlssMode before 0.5.0, still read): native (dlaa: the
+        // light traced at the game's resolution), quality, balanced, performance, ultra-performance (traced smaller,
+        // upscaled by Ray Reconstruction, or by FSR after our filter).
         public DlssMode DlssMode = DlssMode.Dlaa;
+        // What upscales the light our filter denoised: auto (AMD FSR where available), fsr, off (Ray Reconstruction
+        // upscales by itself).
+        public Upscaler Upscaler = Upscaler.Auto;
+        // FSR's sharpening: 0 (off) to 1.
+        public float FsrSharpness;
         // Multipliers of the lamps' light (traced, and the game's own beyond the traced area) and of the light
         // emissive surfaces cast (not their own glow); 1 = as the game sets them.
         public float LampIntensity = 1f;
@@ -73,10 +79,13 @@ namespace SpaceEngineers.RTHWAccel
         // Who presents the game's frames: game (its own D3D11 swap chain) or d3d12 (the native core's D3D12 swap
         // chain on the game's window, the base of frame generation; for tests while frame generation is built).
         public string Presenter = "game";
-        // DLSS Frame Generation, the player's switch ([RayTracing] FrameGeneration, the Path tracing screen).
-        public bool FrameGenerationOn;
-        // The presenter's mode at the start (from FrameGenerationOn, or [Debug] FrameGeneration for tests): off, on,
-        // streamline (presented through Streamline with DLSS-G off: the integration's check).
+        // Frame generation, the player's choice ([RayTracing] FrameGeneration, the Path tracing screen): off, auto
+        // (DLSS Frame Generation on NVIDIA GPUs that run it, else AMD FSR's), dlss, fsr. true reads as auto, false as
+        // off (0.4.0's switch).
+        public FrameGenerationMode FrameGenerationMode = FrameGenerationMode.Off;
+        // The presenter's mode at the start: the above, or [Debug] FrameGeneration for tests: off, auto, dlss (also
+        // "on"), fsr, streamline (ours through Streamline with DLSS-G off), fsr-chain (FSR's swap chain with its
+        // generation off).
         public string FrameGeneration = "off";
         // Unattended runs: halfway through AutoQuitSeconds, the game window as Windows composes it saved to
         // CapturePath (window-d3d12.png or window-game.png: what the presenter puts on screen).
@@ -128,7 +137,11 @@ namespace SpaceEngineers.RTHWAccel
             settings.CharacterLights = ReadBool(path, "RayTracing", "CharacterLights", settings.CharacterLights);
             settings.DecalLights = ReadBool(path, "RayTracing", "DecalLights", settings.DecalLights);
             settings.LightTree = ReadBool(path, "RayTracing", "LightTree", settings.LightTree);
-            settings.DlssMode = ReadDlssMode(path, "RayTracing", "DlssMode", settings.DlssMode);
+            settings.DlssMode = ReadDlssMode(path, "RayTracing", "UpscalingMode",
+                                             ReadDlssMode(path, "RayTracing", "DlssMode", settings.DlssMode));
+            settings.Upscaler = ReadUpscaler(path, "RayTracing", "Upscaler", settings.Upscaler);
+            double sharpness = ReadDouble(path, "RayTracing", "FsrSharpness", settings.FsrSharpness);
+            settings.FsrSharpness = sharpness >= 0 && sharpness <= 1 ? (float)sharpness : settings.FsrSharpness;
             settings.LampIntensity = ReadIntensity(path, "LampIntensity", settings.LampIntensity);
             settings.EmissiveIntensity = ReadIntensity(path, "EmissiveIntensity", settings.EmissiveIntensity);
             settings.PatchShaders = ReadBool(path, "RayTracing", "PatchShaders", settings.PatchShaders);
@@ -145,11 +158,14 @@ namespace SpaceEngineers.RTHWAccel
             settings.MirrorTransparent = ReadBool(path, "Debug", "MirrorTransparent", settings.MirrorTransparent);
             settings.HandOffOrder = ReadString(path, "Debug", "HandOffOrder", settings.HandOffOrder).ToLowerInvariant();
             settings.Presenter = ReadString(path, "Debug", "Presenter", settings.Presenter).ToLowerInvariant();
-            settings.FrameGenerationOn = ReadBool(path, "RayTracing", "FrameGeneration", settings.FrameGenerationOn);
+            settings.FrameGenerationMode = ParseFrameGeneration(ReadString(path, "RayTracing", "FrameGeneration", ""),
+                                                                settings.FrameGenerationMode);
             string frameGeneration = ReadString(path, "Debug", "FrameGeneration", "").ToLowerInvariant();
+            if (frameGeneration == "on")
+                frameGeneration = "dlss";  // the tests' name before FSR
             settings.FrameGeneration = frameGeneration.Length != 0 ? frameGeneration
-                                     : settings.FrameGenerationOn ? "on" : "off";
-            if (settings.FrameGeneration != "on" && settings.FrameGeneration != "streamline")
+                                     : FrameGenerationName(settings.FrameGenerationMode);
+            if (PresenterModeFor(settings.FrameGeneration) == 0)
                 settings.FrameGeneration = "off";
             settings.CaptureWindow = ReadBool(path, "Debug", "CaptureWindow", settings.CaptureWindow);
             settings.Foreground = ReadBool(path, "Debug", "Foreground", settings.Foreground);
@@ -172,7 +188,8 @@ namespace SpaceEngineers.RTHWAccel
 
         public override string ToString() =>
             $"GateMode={GateMode}, DebugView={DebugView}, Denoiser={Denoiser}, CharacterLights={CharacterLights}, " +
-            $"DecalLights={DecalLights}, LightTree={LightTree}, DlssMode={DlssMode}, " +
+            $"DecalLights={DecalLights}, LightTree={LightTree}, UpscalingMode={DlssMode}, Upscaler={Upscaler}, " +
+            $"FsrSharpness={FsrSharpness.ToString(CultureInfo.InvariantCulture)}, " +
             $"LampIntensity={LampIntensity.ToString(CultureInfo.InvariantCulture)}, " +
             $"EmissiveIntensity={EmissiveIntensity.ToString(CultureInfo.InvariantCulture)}, " +
             $"PatternStrength={PatternStrength.ToString(CultureInfo.InvariantCulture)}, " +
@@ -190,8 +207,13 @@ namespace SpaceEngineers.RTHWAccel
                                   : GateMode == GateMode.RoundTrip ? "roundtrip" : "replace");
             ok &= Write("Denoiser", Denoiser == Denoiser.RayReconstruction ? "rr"
                                   : Denoiser == Denoiser.Filter ? "filter" : "auto");
-            ok &= Write("DlssMode", DlssModeName(DlssMode));
-            ok &= Write("FrameGeneration", FrameGenerationOn ? "true" : "false");
+            ok &= Write("UpscalingMode", DlssModeName(DlssMode));
+            // An INI from before 0.5.0 names the mode DlssMode: kept in step (UpscalingMode is read first).
+            if (ReadString(Path, "RayTracing", "DlssMode", "").Length != 0)
+                ok &= Write("DlssMode", DlssModeName(DlssMode));
+            ok &= Write("Upscaler", UpscalerName(Upscaler));
+            ok &= Write("FsrSharpness", FsrSharpness.ToString("0.0#", culture));
+            ok &= Write("FrameGeneration", FrameGenerationName(FrameGenerationMode));
             ok &= Write("LightTree", LightTree ? "true" : "false");
             ok &= Write("CharacterLights", CharacterLights ? "true" : "false");
             ok &= Write("DecalLights", DecalLights ? "true" : "false");
@@ -210,7 +232,65 @@ namespace SpaceEngineers.RTHWAccel
                 case DlssMode.Balanced: return "balanced";
                 case DlssMode.Performance: return "performance";
                 case DlssMode.UltraPerformance: return "ultra-performance";
-                default: return "dlaa";
+                default: return "native";
+            }
+        }
+
+        internal static string FrameGenerationName(FrameGenerationMode mode)
+        {
+            switch (mode)
+            {
+                case FrameGenerationMode.Auto: return "auto";
+                case FrameGenerationMode.Dlss: return "dlss";
+                case FrameGenerationMode.Fsr: return "fsr";
+                default: return "off";
+            }
+        }
+
+        internal static FrameGenerationMode ParseFrameGeneration(string text, FrameGenerationMode fallback)
+        {
+            switch ((text ?? "").Trim().ToLowerInvariant())
+            {
+                case "off": case "false": case "0": case "no": return FrameGenerationMode.Off;
+                case "auto": case "true": case "1": case "yes": case "on": return FrameGenerationMode.Auto;
+                case "dlss": return FrameGenerationMode.Dlss;
+                case "fsr": return FrameGenerationMode.Fsr;
+                default: return fallback;
+            }
+        }
+
+        // The native presenter's mode for a frame generation name (NativeApi.RtSetPresenter; 0 for off or unknown).
+        internal static int PresenterModeFor(string frameGeneration)
+        {
+            switch (frameGeneration)
+            {
+                case "auto": return 6;
+                case "dlss": return 3;
+                case "fsr": return 4;
+                case "streamline": return 2;
+                case "fsr-chain": return 5;
+                default: return 0;
+            }
+        }
+
+        internal static string UpscalerName(Upscaler upscaler)
+        {
+            switch (upscaler)
+            {
+                case Upscaler.Fsr: return "fsr";
+                case Upscaler.Off: return "off";
+                default: return "auto";
+            }
+        }
+
+        private static Upscaler ReadUpscaler(string path, string section, string key, Upscaler fallback)
+        {
+            switch (ReadString(path, section, key, "").Trim().ToLowerInvariant())
+            {
+                case "auto": return Upscaler.Auto;
+                case "fsr": return Upscaler.Fsr;
+                case "off": case "none": return Upscaler.Off;
+                default: return fallback;
             }
         }
 
@@ -277,6 +357,7 @@ namespace SpaceEngineers.RTHWAccel
                 case "lit-filter": return DebugView.LitFilter;
                 case "emitters-reference": return DebugView.EmittersReference;
                 case "emitters-power-grid": return DebugView.EmittersPowerGrid;
+                case "lit-fsr": return DebugView.LitFsr;
                 default: return fallback;
             }
         }

@@ -107,6 +107,26 @@ if(DEFINED STREAMLINE_DIR AND NOT STREAMLINE_DIR STREQUAL "")
     endforeach()
 endif()
 
+# AMD FSR (upscaling and frame generation): AMD's signed runtime and its licence, when the build has the FSR SDK
+# (third_party/fsr, scripts/fetch_fsr.ps1). The licence allows redistributing the DLLs unmodified, in binary form,
+# with its notices (third_party/fsr/UPSTREAM.md).
+if(DEFINED FSR_DIR AND NOT FSR_DIR STREQUAL "")
+    set(fsr_runtimes
+        amd_fidelityfx_loader_dx12.dll amd_fidelityfx_upscaler_dx12.dll amd_fidelityfx_framegeneration_dx12.dll)
+    foreach(runtime IN LISTS fsr_runtimes)
+        if(NOT EXISTS "${FSR_DIR}/signedbin/${runtime}")
+            message(FATAL_ERROR "FSR packaging input missing: ${FSR_DIR}/signedbin/${runtime}")
+        endif()
+        file(COPY_FILE "${FSR_DIR}/signedbin/${runtime}" "${OUTPUT_DIR}/${runtime}" ONLY_IF_DIFFERENT)
+        list(APPEND package_files "${runtime}")
+    endforeach()
+    if(NOT EXISTS "${FSR_DIR}/docs/license.md")
+        message(FATAL_ERROR "FSR packaging input missing: ${FSR_DIR}/docs/license.md")
+    endif()
+    file(COPY_FILE "${FSR_DIR}/docs/license.md" "${OUTPUT_DIR}/AMD-FSR-LICENSE.txt" ONLY_IF_DIFFERENT)
+    list(APPEND package_files AMD-FSR-LICENSE.txt)
+endif()
+
 if(MODE STREQUAL "loader-bundled")
     file(COPY_FILE "${LOADER_FILE}" "${OUTPUT_DIR}/${LOADER_NAME}"
          ONLY_IF_DIFFERENT)

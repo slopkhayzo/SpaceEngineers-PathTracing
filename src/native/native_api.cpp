@@ -84,6 +84,8 @@ int __cdecl RtInitialize(void* d3d11Device, const RtOptions* options) {
         parsed.decalLights = options->decalLights != 0;
         parsed.lightTree = options->lightTree != 0;
         parsed.dlssMode = static_cast<rt::DlssMode>(std::clamp(options->dlssMode, 0, 4));
+        parsed.upscaler = static_cast<rt::Upscaler>(std::clamp(options->upscaler, 0, 2));
+        parsed.fsrSharpness = std::clamp(options->fsrSharpness, 0.0f, 1.0f);
         parsed.tracePath = options->tracePath != nullptr ? options->tracePath : L"";
         return rt::Initialize(static_cast<ID3D11Device*>(d3d11Device), parsed);
     } catch (...) {
@@ -290,7 +292,18 @@ void __cdecl RtCaptureHudless() {
 
 int __cdecl RtFrameGenStatus(wchar_t* text, const int capacity) {
     std::wstring reason;
-    const int status = rt::FrameGenStatus(reason);
+    const int status = rt::FrameGenerationStatus(reason);
+    if (text != nullptr && capacity > 0) {
+        const std::size_t count = std::min(reason.size(), static_cast<std::size_t>(capacity - 1));
+        std::copy_n(reason.data(), count, text);
+        text[count] = L'\0';
+    }
+    return status;
+}
+
+int __cdecl RtFsrStatus(wchar_t* text, const int capacity) {
+    std::wstring reason;
+    const int status = rt::FsrStatus(reason);
     if (text != nullptr && capacity > 0) {
         const std::size_t count = std::min(reason.size(), static_cast<std::size_t>(capacity - 1));
         std::copy_n(reason.data(), count, text);
@@ -337,6 +350,7 @@ const NativeApi g_api{
     &RtPresenterAttach,
     &RtCaptureHudless,
     &RtFrameGenStatus,
+    &RtFsrStatus,
 };
 
 } // namespace

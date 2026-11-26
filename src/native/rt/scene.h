@@ -254,8 +254,10 @@ struct SceneFrame {
 // Any thread: the LampIntensity setting for the lamps uploaded from the next frame on.
 void SceneSetLampIntensity(float lampIntensity);
 
+// `transportMode` ([Debug] GeometryTransport): 0 auto (the legacy-shared buffer, the texture path when its check
+// fails), 1 the legacy-shared buffer only, 2 the texture path (for testing the fallback).
 [[nodiscard]] bool SceneInitialize(const Devices& devices, D3D12_CPU_DESCRIPTOR_HANDLE pageDescriptors,
-                                   UINT descriptorSize, float lampIntensity);
+                                   UINT descriptorSize, float lampIntensity, int transportMode);
 
 // Any thread. Handles are never 0.
 [[nodiscard]] std::uint32_t SceneCreateMesh(const RtMeshDesc& desc);
@@ -292,8 +294,14 @@ void SceneSubmitSkins(const RtSkin* skins, std::uint32_t skinCount, const float*
 
 // Render thread, at the gate before the ready signal: copies the geometry
 // registered since the last gate into the transport buffer (D3D11 immediate
-// context). Every call must be followed by SceneRecord in the same gate.
+// context). Every call must be followed by SceneRecord in the same gate. At
+// the first gates it sends the transport check's pattern instead, until
+// SceneCollect finds it arrived intact.
 void SceneCopyIn(ID3D11DeviceContext* immediate);
+
+// Render thread, after SceneCollect: the geometry transport does not work on
+// this driver (logged): the traced scene would stay empty.
+[[nodiscard]] bool SceneTransportBroken();
 
 // Render thread, inside the gate's D3D12 window: geometry upload, position
 // decode and BLAS builds of what SceneCopyIn copied, block expansion and the

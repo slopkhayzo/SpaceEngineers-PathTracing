@@ -18,9 +18,11 @@
 //     (distance from the centre's tangent plane, normal) and at light
 //     differences the variance does not explain; the specular light only
 //     while Step stays within its lobe (16 * roughness^2 pixels)
-//   2 compose: Output = albedo * (emission + diffuse) + specular
-//   3 Ray Reconstruction's output over the lit pixels (lit-rr view), over the output's size: Step and Source
-//     carry it (it is larger than Width x Height where Ray Reconstruction upscales, DLSS modes)
+//   2 compose: Output = albedo * (emission + diffuse) + specular; with Flags 1 into RrColor instead, FSR's input
+//     (rt_core.cpp FsrUpscale)
+//   3 Ray Reconstruction's or FSR's output over the lit pixels, over the output's size: Step and Source carry it
+//     (it is larger than Width x Height where they upscale, DLSS and FSR modes); with Flags 1 (FSR) by the game's
+//     surfaces at any size
 // Filter alpha: the variance; -1 where the pixel is not lit (the game's own
 // light stays there).
 
@@ -32,7 +34,8 @@ RWTexture2D<float4> HistorySpecular : register(u3);  // rgb the specular light, 
 RWTexture2D<float4> AlbedoEmission : register(u4);   // rgb the albedo, a the emission (times the albedo)
 RWTexture2D<float4> FilterDiffuse[2] : register(u5);
 RWTexture2D<float4> FilterSpecular[2] : register(u7);
-// Pass 3 (lit-rr): Ray Reconstruction's input (alpha: the lit pixels) and output (rt_core.cpp).
+// Ray Reconstruction's input (alpha: the lit pixels) and output, which FSR's are too (rt_core.cpp): pass 2 writes
+// FSR's input, pass 3 composes either's output.
 RWTexture2D<float4> RrColor : register(u19);
 RWTexture2D<float4> RrOutput : register(u24);
 
@@ -54,7 +57,7 @@ cbuffer Denoise : register(b2)
     uint Pass;
     uint Step;    // a-trous: the distance between taps (pixels)
     uint Source;  // the Filter textures read
-    uint Padding;
+    uint Flags;   // passes 2 and 3: 1 when FSR upscales the light (see above)
 };
 
 static const float kKernel[2] = {0.5, 0.25};  // B3 spline, 3 taps: centre, side
@@ -276,9 +279,9 @@ void Atrous(int2 p)
                                                 : s;
 }
 
-// Ray Reconstruction's light on the lit pixels (the others keep the primary pass's alpha 0). Upscaled from a
-// smaller size, the primary pass wrote no output: every pixel here, lit where the game drew a surface other than
-// grass (what full coverage, the only coverage then, lights; primary_view.hlsl), the game's own light elsewhere.
+// Ray Reconstruction's or FSR's light on the lit pixels (the others keep the primary pass's alpha 0). Upscaled from
+// a smaller size (and always for FSR), every pixel here: lit where the game drew a surface other than grass (what
+// full coverage, the only coverage then, lights; primary_view.hlsl), the game's own light elsewhere.
 void ComposeRayReconstruction(int2 p, bool upscaled)
 {
     if (upscaled)
@@ -299,7 +302,11 @@ void Compose(int2 p)
     if (d.a < 0)
         return;
     float4 surface = AlbedoEmission[p];
-    Output[p] = float4(surface.rgb * (surface.a + d.rgb) + FilterSpecular[Source][p].rgb, Output[p].a);
+    float3 light = surface.rgb * (surface.a + d.rgb) + FilterSpecular[Source][p].rgb;
+    if ((Flags & 1) != 0)
+        RrColor[p] = float4(light, 1);
+    else
+        Output[p] = float4(light, Output[p].a);
 }
 
 [numthreads(8, 8, 1)]
@@ -317,5 +324,5 @@ void main(uint3 id : SV_DispatchThreadID)
     else if (Pass == 2)
         Compose(p);
     else
-        ComposeRayReconstruction(p, size.x != Width || size.y != Height);
+        ComposeRayReconstruction(p, (Flags & 1) != 0 || size.x != Width || size.y != Height);
 }

@@ -101,17 +101,20 @@ namespace SpaceEngineers.RTHWAccel
     // The plugin's settings screen: the settings that change while playing, applied at once and written to the INI.
     internal sealed class PathTracingScreen : MyGuiScreenBase
     {
-        private static readonly Vector2 kSize = new Vector2(0.56f, 0.71f);
+        private static readonly Vector2 kSize = new Vector2(0.56f, 0.81f);
         private const float kRowStep = 0.05f;
         private readonly Settings m_settings;
+        private MyGuiControlCombobox m_upscaler;
         private MyGuiControlCombobox m_dlssMode;
-        private MyGuiControlCheckbox m_frameGeneration;
+        private MyGuiControlSlider m_fsrSharpness;
+        private MyGuiControlCombobox m_frameGeneration;
         private bool m_saveFailureLogged;
 
         private const string FrameGenerationToolTip =
-            "DLSS Frame Generation: a frame made between each two the game draws, for smoother motion at slightly " +
-            "more latency. Needs an NVIDIA GeForce RTX 40 or 50 series GPU, hardware-accelerated GPU scheduling and " +
-            "DLSS Ray Reconstruction (the denoiser). RivaTuner's on-screen display slows it down a lot.";
+            "A frame made between each two the game draws, for smoother motion at slightly more latency. DLSS Frame " +
+            "Generation needs an NVIDIA GeForce RTX 40 or 50 series GPU and hardware-accelerated GPU scheduling; AMD " +
+            "FSR Frame Generation runs on any GPU the plugin runs on (not tested on AMD GPUs). Auto takes DLSS where " +
+            "it runs, else FSR. RivaTuner's on-screen display slows it down a lot.";
 
         internal const string Caption = "Path tracing";
 
@@ -126,9 +129,9 @@ namespace SpaceEngineers.RTHWAccel
 
         public override string GetFriendlyName() => "PathTracingSettings";
 
-        // The DLSS mode drop-down and the frame generation switch, for the automated check.
+        // The upscaling mode and frame generation drop-downs, for the automated check.
         internal MyGuiControlCombobox DlssModeCombobox => m_dlssMode;
-        internal MyGuiControlCheckbox FrameGenerationCheckbox => m_frameGeneration;
+        internal MyGuiControlCombobox FrameGenerationCombobox => m_frameGeneration;
 
         public override void RecreateControls(bool constructor)
         {
@@ -174,40 +177,72 @@ namespace SpaceEngineers.RTHWAccel
             {
                 m_settings.Denoiser = (Denoiser)denoiser.GetSelectedKey();
                 NativeApi.RtSetOption(RtOption.Denoiser, (int)m_settings.Denoiser);
-                m_dlssMode.Enabled = m_settings.Denoiser != Denoiser.Filter;
-                m_frameGeneration.Enabled = m_settings.Denoiser != Denoiser.Filter;
+                UpdateEnabled();
                 Save();
             };
             y += kRowStep;
 
-            Label("DLSS mode", left, y);
+            // FSR after the plugin's filter (Auto picks DLSS Ray Reconstruction on NVIDIA RTX GPUs, which upscales by
+            // itself): AMD's loader takes FSR 4 on the Radeons it supports, FSR 3.1 elsewhere.
+            NativeApi.RtFsrStatus(out string fsrStatus);
+            Label("Upscaler", left, y);
+            m_upscaler = Combobox(right, y,
+                "With the plugin's filter: AMD FSR upscales the light traced at the upscaling mode's resolution and " +
+                "smooths its edges (at Native, the light is traced at full resolution). DLSS Ray Reconstruction " +
+                "upscales by itself. Not tested on AMD GPUs. AMD FSR here: " + fsrStatus + ".");
+            m_upscaler.AddItem((long)Upscaler.Auto, "Auto", null, null, false);
+            m_upscaler.AddItem((long)Upscaler.Fsr, "AMD FSR", null, null, false);
+            m_upscaler.AddItem((long)Upscaler.Off, "Off", null, null, false);
+            m_upscaler.SelectItemByKey((long)m_settings.Upscaler, false);
+            m_upscaler.ItemSelected += () =>
+            {
+                m_settings.Upscaler = (Upscaler)m_upscaler.GetSelectedKey();
+                NativeApi.RtSetOption(RtOption.Upscaler, (int)m_settings.Upscaler);
+                Log.Info($"Options screen: upscaler {m_settings.Upscaler}.");
+                UpdateEnabled();
+                Save();
+            };
+            y += kRowStep;
+
+            Label("Upscaling mode", left, y);
             m_dlssMode = Combobox(right, y,
-                "With Ray Reconstruction: DLAA traces the light at full resolution; the other modes trace it smaller " +
-                "and let Ray Reconstruction upscale it (much cheaper, softer). The game's own rendering keeps its " +
-                "resolution.");
-            m_dlssMode.AddItem((long)DlssMode.Dlaa, "DLAA", null, null, false);
+                "Native traces the light at full resolution (DLAA with Ray Reconstruction, FSR's native AA); the other " +
+                "modes trace it smaller and let Ray Reconstruction or FSR upscale it (much cheaper, softer). The " +
+                "game's own rendering keeps its resolution.");
+            m_dlssMode.AddItem((long)DlssMode.Dlaa, "Native", null, null, false);
             m_dlssMode.AddItem((long)DlssMode.Quality, "Quality", null, null, false);
             m_dlssMode.AddItem((long)DlssMode.Balanced, "Balanced", null, null, false);
             m_dlssMode.AddItem((long)DlssMode.Performance, "Performance", null, null, false);
             m_dlssMode.AddItem((long)DlssMode.UltraPerformance, "Ultra performance", null, null, false);
             m_dlssMode.SelectItemByKey((long)m_settings.DlssMode, false);
-            m_dlssMode.Enabled = m_settings.Denoiser != Denoiser.Filter;
             m_dlssMode.ItemSelected += () =>
             {
                 m_settings.DlssMode = (DlssMode)m_dlssMode.GetSelectedKey();
                 NativeApi.RtSetDlssMode(m_settings.DlssMode);
-                Log.Info($"Options screen: DLSS mode {m_settings.DlssMode}.");
+                Log.Info($"Options screen: upscaling mode {m_settings.DlssMode}.");
                 Save();
             };
             y += kRowStep;
 
-            // Frame generation uses Ray Reconstruction's depth: not with the plugin's own filter.
-            Label("DLSS Frame Generation", left, y);
-            m_frameGeneration = new MyGuiControlCheckbox(position: new Vector2(right, y), toolTip: FrameGenerationToolTip,
-                isChecked: m_settings.FrameGenerationOn, originAlign: MyGuiDrawAlignEnum.HORISONTAL_RIGHT_AND_VERTICAL_CENTER);
-            m_frameGeneration.Enabled = m_settings.Denoiser != Denoiser.Filter;
-            m_frameGeneration.IsCheckedChanged += SwitchFrameGeneration;
-            Controls.Add(m_frameGeneration);
+            m_fsrSharpness = Slider("FSR sharpening", left, right, y, m_settings.FsrSharpness,
+                "AMD FSR's sharpening pass, 0 (off) to 1.",
+                value =>
+                {
+                    m_settings.FsrSharpness = value;
+                    NativeApi.RtSetOption(RtOption.FsrSharpness, value);
+                }, 1f, 0.05f, "0.00");
+            y += kRowStep;
+
+            // Frame generation, with any denoiser: the traced frame's depth and motion come from the primary pass.
+            Label("Frame generation", left, y);
+            m_frameGeneration = Combobox(right, y, FrameGenerationToolTip);
+            m_frameGeneration.AddItem((long)FrameGenerationMode.Off, "Off", null, null, false);
+            m_frameGeneration.AddItem((long)FrameGenerationMode.Auto, "Auto", null, null, false);
+            m_frameGeneration.AddItem((long)FrameGenerationMode.Dlss, "DLSS Frame Generation", null, null, false);
+            m_frameGeneration.AddItem((long)FrameGenerationMode.Fsr, "AMD FSR Frame Generation", null, null, false);
+            m_frameGeneration.SelectItemByKey((long)m_settings.FrameGenerationMode, false);
+            m_frameGeneration.ItemSelected += SwitchFrameGeneration;
+            UpdateEnabled();
             y += kRowStep;
 
             Checkbox("Lamps light at any distance", left, right, y, m_settings.LightTree,
@@ -262,28 +297,47 @@ namespace SpaceEngineers.RTHWAccel
             Controls.Add(done);
         }
 
-        // On: frame generation started (Streamline loads the first time: a moment's pause) or, when it cannot run, the
-        // switch back off and the reason shown. Off: the game presents as without it.
-        private void SwitchFrameGeneration(MyGuiControlCheckbox checkbox)
+        // The rows that depend on the denoiser and the upscaler: the upscaler and FSR's sharpening only where the plugin's
+        // filter may denoise (Auto falls back to it without Ray Reconstruction); the mode wherever something upscales.
+        private void UpdateEnabled()
         {
-            bool on = checkbox.IsChecked;
-            if (on == m_settings.FrameGenerationOn)
-                return;  // set back below
-            int status = RayTracing.SetFrameGeneration(on, out string note);
-            if (on && status == 2)
+            bool filterMayDenoise = m_settings.Denoiser != Denoiser.RayReconstruction;
+            m_upscaler.Enabled = filterMayDenoise;
+            m_fsrSharpness.Enabled = filterMayDenoise && m_settings.Upscaler != Upscaler.Off;
+            m_dlssMode.Enabled = m_settings.Denoiser != Denoiser.Filter || m_settings.Upscaler != Upscaler.Off;
+        }
+
+        private static string FrameGenerationLabel(FrameGenerationMode mode) =>
+            mode == FrameGenerationMode.Dlss ? "DLSS Frame Generation"
+            : mode == FrameGenerationMode.Fsr ? "AMD FSR Frame Generation"
+            : "Frame generation";
+
+        // On: frame generation started (Streamline or FSR load the first time: a moment's pause) or, when it cannot run,
+        // switched off again and the reason shown. Off: the game presents as without it.
+        private void SwitchFrameGeneration()
+        {
+            var mode = (FrameGenerationMode)m_frameGeneration.GetSelectedKey();
+            if (mode == m_settings.FrameGenerationMode)
+                return;
+            int status = RayTracing.SetFrameGeneration(mode, out string note);
+            if (mode != FrameGenerationMode.Off && status == 2)
             {
-                Log.Warning("Options screen: DLSS Frame Generation is unavailable: " + note + ".");
-                checkbox.IsChecked = false;
+                Log.Warning($"Options screen: {FrameGenerationLabel(mode)} is unavailable: {note}.");
+                RayTracing.SetFrameGeneration(FrameGenerationMode.Off, out _);
+                m_settings.FrameGenerationMode = FrameGenerationMode.Off;
+                m_frameGeneration.SelectItemByKey((long)FrameGenerationMode.Off, false);
                 MyGuiSandbox.AddScreen(MyGuiSandbox.CreateMessageBox(
-                    messageText: new StringBuilder("DLSS Frame Generation is unavailable: " + note + "."),
+                    messageText: new StringBuilder($"{FrameGenerationLabel(mode)} is unavailable: {note}."),
                     messageCaption: new StringBuilder(Caption)));
+                Save();
                 return;
             }
-            m_settings.FrameGenerationOn = on;
-            Log.Info($"Options screen: DLSS Frame Generation {(on ? "on" : "off")}{(note.Length != 0 ? " (" + note + ")" : "")}.");
-            if (on && note.Length != 0)
+            m_settings.FrameGenerationMode = mode;
+            Log.Info($"Options screen: frame generation {Settings.FrameGenerationName(mode)}" +
+                     $"{(note.Length != 0 ? " (" + note + ")" : "")}.");
+            if (mode != FrameGenerationMode.Off && note.Length != 0)
                 MyGuiSandbox.AddScreen(MyGuiSandbox.CreateMessageBox(styleEnum: MyMessageBoxStyleEnum.Info,
-                    messageText: new StringBuilder("DLSS Frame Generation is on. Note: " + note + "."),
+                    messageText: new StringBuilder($"{FrameGenerationLabel(mode)} is on. Note: {note}."),
                     messageCaption: new StringBuilder(Caption)));
             Save();
         }
@@ -315,27 +369,31 @@ namespace SpaceEngineers.RTHWAccel
             Controls.Add(checkbox);
         }
 
-        // 0 to 5 in steps of 0.1 (the INI takes up to 100), the value beside it.
-        private void Slider(string text, float left, float right, float y, float value, string toolTip, Action<float> apply)
+        // 0 to `maximum` (by default 5: the INI takes up to 100 for the light multipliers) in steps of `step`, the value
+        // beside it.
+        private MyGuiControlSlider Slider(string text, float left, float right, float y, float value, string toolTip,
+            Action<float> apply, float maximum = 5f, float step = 0.1f, string format = "0.0")
         {
             Label(text, left, y);
-            var shown = new MyGuiControlLabel(position: new Vector2(right, y), text: Format(value),
+            var shown = new MyGuiControlLabel(position: new Vector2(right, y), text: Format(value, format),
                 originAlign: MyGuiDrawAlignEnum.HORISONTAL_RIGHT_AND_VERTICAL_CENTER);
-            var slider = new MyGuiControlSlider(position: new Vector2(right - 0.06f, y), minValue: 0f, maxValue: 5f,
-                width: 0.18f, defaultValue: Math.Min(value, 5f), toolTip: toolTip,
+            var slider = new MyGuiControlSlider(position: new Vector2(right - 0.06f, y), minValue: 0f, maxValue: maximum,
+                width: 0.18f, defaultValue: Math.Min(value, maximum), toolTip: toolTip,
                 originAlign: MyGuiDrawAlignEnum.HORISONTAL_RIGHT_AND_VERTICAL_CENTER);
             slider.ValueChanged += s =>
             {
-                float rounded = (float)Math.Round(s.Value, 1);
-                shown.Text = Format(rounded);
+                float rounded = (float)(Math.Round(s.Value / step) * step);
+                shown.Text = Format(rounded, format);
                 apply(rounded);
                 Save();
             };
             Controls.Add(slider);
             Controls.Add(shown);
+            return slider;
         }
 
-        private static string Format(float value) => value.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture);
+        private static string Format(float value, string format) =>
+            value.ToString(format, System.Globalization.CultureInfo.InvariantCulture);
 
         private static bool s_savedLogged;
 

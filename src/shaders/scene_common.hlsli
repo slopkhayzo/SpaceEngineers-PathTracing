@@ -89,6 +89,13 @@ cbuffer Primary : register(b0)
     // smaller size (DLSS modes; primary_view.hlsl GBufferTexel).
     uint GBufferWidth;
     uint GBufferHeight;
+    // Bit 1 where an upscaler after our filter takes this frame's light (FSR): primary_view.hlsl writes every
+    // pixel's light into RrColor (denoise.hlsl pass 2 puts the filtered light over the lit pixels'). Bit 2 where
+    // frame generation takes its inputs. Either, and Ray Reconstruction's view: the game's reverse-Z depth of what
+    // each pixel shows (UpscaleDepth).
+    uint UpscaleInputs;
+    float ProjM33;  // the game's projection: depth = ProjM43 / z - ProjM33 (1 at the near plane, 0 at infinity)
+    float ProjM43;
 };
 
 // The game's own frame constants (MyCommon.FrameConstantsData), as its shaders read them.

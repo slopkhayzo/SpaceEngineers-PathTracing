@@ -122,6 +122,8 @@ namespace SpaceEngineers.RTHWAccel
             // test against the game's G-buffer); Ray Reconstruction (as the setting resolves), then our filter.
             Step(GateMode.Replace, DebugView.Lit, 12, "lit-replace");
             Step(GateMode.Replace, DebugView.LitFilter, 12, "lit-filter-replace");
+            // Our filter, then AMD FSR (in the upscaling mode the settings have).
+            Step(GateMode.Replace, DebugView.LitFsr, 12, "lit-fsr-replace");
             // The glowing decals' light, A/B in the same view within the session (the machine's own drift from run
             // to run is as large as its cost): windows with it off and on in turn (the log's "gate mode is now"
             // lines say "glowing decals only glow" for the former), then as the settings have it.
@@ -160,6 +162,23 @@ namespace SpaceEngineers.RTHWAccel
                          round == 0 ? "lit-replace-dlss-" + dlssMode.ToString().ToLowerInvariant() : null);
                 }
             }
+            NativeApi.RtSetDlssMode(settings.DlssMode);
+            // AMD FSR after our filter in the same modes, A/B in the same view within the session (the log's "FSR:" line
+            // of each window names its version, the mode and both sizes); FSR's debug view once (with diagnostics:
+            // the motion vectors, the history's blend); then as the settings have it.
+            for (int round = 0; round < 2; ++round)
+            {
+                foreach (DlssMode mode in dlssModes)
+                {
+                    NativeApi.RtSetDlssMode(mode);
+                    Step(GateMode.Replace, DebugView.LitFsr, 7,
+                         round == 0 ? "lit-replace-fsr-" + mode.ToString().ToLowerInvariant() : null);
+                }
+            }
+            NativeApi.RtSetDlssMode(DlssMode.Performance);
+            NativeApi.RtSetOption(RtOption.FsrDebugView, 1);
+            Step(GateMode.Replace, DebugView.LitFsr, 5, "lit-replace-fsr-debug");
+            NativeApi.RtSetOption(RtOption.FsrDebugView, 0);
             NativeApi.RtSetDlssMode(settings.DlssMode);
             // Emissive surfaces as lights alone (replace: without the game's local lights on top), then the same
             // without reusing light samples: the unbiased reference the reuse must match on average (the log's
@@ -205,6 +224,7 @@ namespace SpaceEngineers.RTHWAccel
             Step(GateMode.Overlay, DebugView.Lit, 10, "lit-moving");
             Step(GateMode.Overlay, DebugView.LitFilter, 10, "lit-filter-moving");
             Step(GateMode.Replace, DebugView.Lit, 10, "lit-replace-moving");
+            Step(GateMode.Replace, DebugView.LitFsr, 10, "lit-fsr-replace-moving");
             Step(GateMode.Off, null, 10, "off-moving");
             // Object motion: back in the player's own view on the ship, the ship drifts and turns (the cockpit
             // case: its interior moves with the camera while the world streams past); the light history follows
@@ -996,18 +1016,24 @@ namespace SpaceEngineers.RTHWAccel
                 CaptureGui(settings, "menu-dlss-performance");
                 Thread.Sleep(1500);
                 OnGameThread(() => screen.DlssModeCombobox.SelectItemByKey((long)before), "the DLSS mode could not be reset");
-                // Frame generation switched on as a click would (Streamline loads now when it did not at the start),
-                // then back to how it was.
-                bool frameGeneration = settings.FrameGenerationOn;
-                Thread.Sleep(1500);
-                OnGameThread(() => screen.FrameGenerationCheckbox.IsChecked = !frameGeneration,
-                    "frame generation could not be switched");
-                Log.Info($"Menu test: frame generation switched {(!frameGeneration ? "on" : "off")} " +
-                         $"({(settings.FrameGenerationOn != frameGeneration ? "taken" : "refused")}).");
-                Thread.Sleep(8000);
-                CaptureGui(settings, "menu-frame-generation");
-                OnGameThread(() => screen.FrameGenerationCheckbox.IsChecked = frameGeneration,
-                    "frame generation could not be switched back");
+                // Frame generation chosen as a click would: AMD FSR's, then DLSS's (FSR's or Streamline load now
+                // when they did not at the start; the switch between them hands the window from one swap chain to the
+                // other), then back to how it was.
+                FrameGenerationMode frameGeneration = settings.FrameGenerationMode;
+                foreach (FrameGenerationMode mode in new[] { FrameGenerationMode.Fsr, FrameGenerationMode.Dlss })
+                {
+                    if (mode == frameGeneration)
+                        continue;
+                    Thread.Sleep(1500);
+                    OnGameThread(() => screen.FrameGenerationCombobox.SelectItemByKey((long)mode),
+                        "frame generation could not be chosen");
+                    Log.Info($"Menu test: frame generation {Settings.FrameGenerationName(mode)} chosen " +
+                             $"({(settings.FrameGenerationMode == mode ? "taken" : "refused")}).");
+                    Thread.Sleep(8000);
+                    CaptureGui(settings, "menu-frame-generation-" + Settings.FrameGenerationName(mode));
+                }
+                OnGameThread(() => screen.FrameGenerationCombobox.SelectItemByKey((long)frameGeneration),
+                    "frame generation could not be set back");
                 Thread.Sleep(3000);
                 OnGameThread(() => screen.CloseScreen(), "the Path tracing screen could not be closed");
             }
